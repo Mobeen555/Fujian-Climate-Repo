@@ -1,5 +1,5 @@
-"""AquaTerra Research AI: a separate Streamlit research application.
-Deploy this entire folder as a new GitHub repository using app.py and Python 3.12.
+"""HydroScope Water Research: a separate Streamlit research application.
+Deploy the folder contents with app.py at the repository root and Python 3.12.
 Scientific calculations use the existing NumPy/Pandas stack; no new mandatory packages.
 External mechanistic models are import/export workflows, not embedded simulators."""
 from __future__ import annotations
@@ -38,13 +38,8 @@ from shapely.geometry import Point, Polygon, mapping, shape
 from shapely.geometry.polygon import orient
 from shapely.ops import transform as shape_transform, unary_union
 from urllib3.util.retry import Retry
-from crew_config import AGENT_ROSTER, DEFAULT_MODEL, DEFAULT_TOKENS_PER_MINUTE
 from ai_providers import DEFAULT_PROVIDER, PROVIDERS
-from evidence import quality_findings, review_is_current, run_fingerprint
-import evidence as evidence_module
-for _domain in ("geospatial_water", "ecology_field", "climate_air"):
-    evidence_module.DOMAIN_MODULES[_domain] = tuple(dict.fromkeys((*evidence_module.DOMAIN_MODULES[_domain], "Research validation")))
-
+from evidence import quality_findings, interpretation_is_current, run_fingerprint
 from environment import (
     DataError,
     FIELD_COLUMNS,
@@ -66,7 +61,6 @@ from environment import (
     landmark_search,
     make_study,
     normalize_geometry,
-    parse_field_csv,
     plain_metadata,
     raster_png,
     safe_frame,
@@ -74,11 +68,10 @@ from environment import (
     utc_now
 )
 
-APP_RELEASE = "1.0"
+APP_RELEASE = "1.0.0"
 
 def inject_theme():
     st.html("""<style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;600;700;800&display=swap');
     .stApp{background:radial-gradient(ellipse at 95% 4%,rgba(111,70,181,.22),transparent 40%),radial-gradient(ellipse at 10% 85%,rgba(16,111,115,.13),transparent 42%),#090E1B;color:#E9EEF7}
     .stApp{color-scheme:dark}
     [data-testid='stMain'],[data-testid='stSidebar']{color:#E9EEF7}
@@ -138,35 +131,6 @@ def banner(title, subtitle):
     st.html(f"<div class='module-banner'><h2>{html.escape(title)}</h2><p>{html.escape(subtitle)}</p></div>")
 
 
-def overview(run):
-    st.html("""<div class='eco-hero' style='background:linear-gradient(125deg,#153a42,#22213c)'>
-    <div class='eyebrow'>AquaTerra Research AI</div><h1>Water, ecology<br>and inspectable evidence.</h1>
-    <p>Connect field observations with satellite measurements. Inspect the method, assess uncertainty,
-    and export the calculations behind every research result.</p>
-    <span class='pill'>Field validation</span><span class='pill'>Spatial analysis</span>
-    <span class='pill'>Five-agent review</span></div>""")
-    for col, label, page in zip(st.columns(3), ["Set up study", "Open research workspace", "Review evidence"],
-                                ["Study & analysis", "Research workspace", "AI team"]):
-        col.button(label, width="stretch", on_click=go_page, args=(page,))
-    for col, title, body in zip(st.columns(3), ["01 / Observe", "02 / Evaluate", "03 / Reproduce"],
-        ["Draw a reservoir and sampling sites. Retrieve real observations with coverage and quality flags.",
-         "Upload Excel or CSV data. Match field samples, examine community patterns and test supported relationships.",
-         "Download data, figures, settings, executed analysis code and an audit record. Estimates keep their validation status."]):
-        with col:
-            with st.container(border=True):
-                st.subheader(title)
-                st.write(body)
-    if run:
-        st.caption(f"Saved study: {run['study']['label']} | {run['study']['start']} to {run['study']['end']}")
-        a,b,c=st.columns(3)
-        a.metric("Study area", f"{run['study']['area_km2']:.1f} km²")
-        b.metric("Completed modules",len(run['results']))
-        c.metric("Source records",len(all_sources(run)))
-    else:
-        st.info("Start in Study & analysis. Draw your reservoir and run at least one selected module, then open Research workspace.")
-    st.caption("Field measurements, satellite indicators and model estimates are labelled separately. Agent agreement is not scientific validation.")
-
-
 def base_map(study, draw=False):
     from folium.plugins import Draw, Fullscreen
     m = folium.Map(location=[study["lat"], study["lon"]], tiles="OpenStreetMap", zoom_start=12, control_scale=True)
@@ -184,17 +148,13 @@ def map_for_run(run, modules=None, raster_layer=None):
     m = base_map(run["study"])
     modules = modules or list(run["results"])
     for module, table_name, frame in all_tables(run):
-        if module not in modules or table_name not in ["Sampling candidates", "Included field observations", "Earthquake events", "Species occurrences"] or frame.empty:
+        if module not in modules or table_name not in ["Sampling candidates", "Included field observations"] or frame.empty:
             continue
         group = folium.FeatureGroup(name=table_name)
         for _, row in frame.iterrows():
+            if pd.isna(row.latitude) or pd.isna(row.longitude):continue
             radius, color, title = 6, "#128C80", table_name
-            if table_name == "Earthquake events":
-                mag = float(row.magnitude) if pd.notna(row.magnitude) else 0
-                radius, color, title = 2 + 1.6*max(0,mag), "#8A5CD1", f"Magnitude {fmt(mag,1)} · depth {fmt(row.depth_km,1)} km"
-            elif table_name == "Species occurrences":
-                title, color, radius = str(row.species), "#579242", 4
-            elif table_name == "Sampling candidates":
+            if table_name == "Sampling candidates":
                 title, color = f"Candidate {row.priority_rank} · NDCI {row.ndci:.3f} (unverified)", "#B98013"
             elif table_name == "Included field observations":
                 title = str(row.site)
@@ -205,8 +165,6 @@ def map_for_run(run, modules=None, raster_layer=None):
             folium.CircleMarker([row.latitude, row.longitude], radius=radius, color=color, weight=1,
                 fill=True, fill_color=color, fill_opacity=.75, tooltip=html.escape(title)).add_to(group)
         group.add_to(m)
-        if modules == ["Earthquakes"]:
-            m.fit_bounds([[frame.latitude.min(),frame.longitude.min()],[frame.latitude.max(),frame.longitude.max()]])
     if raster_layer:
         r = run["results"].get("Satellite", {}).get("raster")
         if r and np.isfinite(r["arrays"][raster_layer]).any():
@@ -239,117 +197,12 @@ def show_map(m, key, height=475, interactive=False):
                      returned_objects=["last_active_drawing", "last_clicked"] if interactive else [])
 
 
-def study_page():
-    st.title("Define your study")
-    st.caption("Choose a place, inspect the boundary and request only the evidence you need.")
-    left,right = st.columns([1,1.65], gap="large")
-    with left:
-        with st.expander("Find a city, lake or landmark", expanded=True):
-            query = st.text_input("Place name", placeholder="Rawal Lake, Islamabad")
-            landmarks = st.checkbox("Include river / landmark search using OpenStreetMap", value=False)
-            if landmarks:
-                st.caption("User-triggered searches only, cached and limited to one request per second for this app; no autocomplete. OpenStreetMap attribution applies.")
-                st.markdown("[Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/)")
-            if st.button("Search place", width="stretch"):
-                if len(query.strip()) < 3:
-                    st.warning("Enter at least three characters.")
-                else:
-                    try:
-                        with st.spinner("Finding matching places…"):
-                            st.session_state["places"] = landmark_search(query.strip()) if landmarks else city_search(query.strip())
-                    except DataError as exc:
-                        st.error(str(exc))
-            places = st.session_state.get("places", [])
-            if places:
-                chosen = st.selectbox("Matching places", range(len(places)), format_func=lambda i: places[i]["label"])
-                if st.button("Use this location"):
-                    p = places[chosen]
-                    st.session_state.update({"study_lat": p["lat"], "study_lon": p["lon"], "study_label": p["label"], "use_boundary": False})
-            elif "places" in st.session_state:
-                st.caption("No matching place. Use coordinates or try the landmark search.")
-        label = st.text_input("Study name", key="study_label")
-        st.caption("A study name labels the result. It does not select the entire river or change the coordinates.")
-        a,b = st.columns(2)
-        lat = a.number_input("Latitude", min_value=-80.0,max_value=80.0,format="%.6f",key="study_lat")
-        lon = b.number_input("Longitude",min_value=-180.0,max_value=180.0,format="%.6f",key="study_lon")
-        radius = st.slider("Study radius (km)",.5,50.0,4.0,.5)
-        start = st.date_input("Historical start", date.today()-timedelta(days=97),max_value=date.today())
-        end = st.date_input("Historical end", date.today()-timedelta(days=7),max_value=date.today())
-        st.caption("Weather and air forecasts start today; they use a separate future window.")
-        upload = st.file_uploader("Optional boundary (GeoJSON, WGS84)",type=["geojson","json"])
-        if upload is not None:
-            try:
-                if upload.size > 2_000_000:
-                    raise DataError("Keep boundary uploads below 2 MB.")
-                parsed = json.loads(upload.getvalue())
-                st.session_state["boundary"] = mapping(normalize_geometry(parsed))
-            except Exception as exc:
-                st.error(f"Boundary could not be used: {str(exc)[:200]}")
-        custom = None
-        if st.session_state.get("boundary"):
-            if st.checkbox("Use uploaded / drawn boundary", key="use_boundary"):
-                custom = st.session_state["boundary"]
-        try:
-            study = make_study(label,lat,lon,radius,start,end,custom)
-        except DataError as exc:
-            st.error(str(exc))
-            study = None
-    with right:
-        if study:
-            response = show_map(base_map(study, True),"draw-study",height=505,interactive=True)
-            drawing = (response or {}).get("last_active_drawing")
-            if drawing:
-                st.button("Use the drawn boundary",type="primary",on_click=apply_drawing,args=(drawing,))
-            if st.session_state.get("drawing_error"):
-                st.error(st.session_state.pop("drawing_error"))
-            st.caption(f"{study['area_km2']:.2f} km² · {study['boundary']} · Weather/air use the centroid grid cell. Drawing a boundary does not delineate an upstream catchment.")
-            st.info(f"Local study centred at {study['lat']:.5f}, {study['lon']:.5f}. For a river, zoom in and check that the boundary actually covers the intended channel or reach. A geocoding result is a reference point, not a river boundary.")
-            if study["area_km2"] > MAX_SAT_KM2:
-                st.info(f"Satellite analysis supports up to {MAX_SAT_KM2:g} km². Other selected modules can still run.")
-    st.subheader("Select analyses")
-    selected = st.multiselect("Modules",MODULES,default=["Climate","Air quality","Satellite","Earthquakes","Biodiversity"])
-    with st.expander("Analysis settings",expanded=False):
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            baseline = st.checkbox("Add 1991–2020 climate baseline",False)
-            st.caption("Uses a longer ERA5 request. Monthly anomalies require complete months.")
-            flow = st.number_input("Optional river screening threshold (m³/s)",min_value=0.0,value=0.0)
-            st.caption("0 disables threshold comparisons. A supplied threshold is not automatically validated.")
-        with c2:
-            scenes = st.slider("Satellite scenes to process",1,6,3)
-            cloud = st.slider("Maximum whole-scene cloud cover (%)",5,90,40,5)
-            water = st.slider("NDWI / MNDWI water screening threshold",-.2,.4,0.0,.05)
-        with c3:
-            quake_radius = st.slider("Earthquake search radius (km)",25,500,150,25)
-            magnitude = st.slider("Minimum earthquake magnitude",0.0,7.0,2.5,.5)
-            st.caption("Earthquake radius is separate from the study boundary. GBIF retrieval is limited to 300 candidate records.")
-    if "US weather alerts" in selected:
-        st.info("The official alert adapter supports US NWS coverage. Outside that area, check your national authority; an empty response does not mean no hazard.")
-    if st.button("Run environmental analysis",type="primary",width="stretch",disabled=study is None):
-        if not selected:
-            st.warning("Select at least one module.")
-        else:
-            options = {"modules":selected,"baseline":baseline,"flow_threshold":flow,"scene_count":scenes,
-                       "cloud_limit":cloud,"water_threshold":water,"quake_radius":quake_radius,"min_magnitude":magnitude}
-            with st.status("Gathering evidence…",expanded=True) as status:
-                run = execute_analysis(study,options,lambda text: st.write(text))
-                st.session_state["run"] = run
-                st.session_state.pop("exports",None)
-                st.session_state.pop("crew_review",None)
-                status.update(label=f"{len(run['results'])} modules completed · {len(run['errors'])} unavailable",state="complete" if run["results"] else "error",expanded=False)
-            for name, error in run["errors"].items():
-                st.warning(f"{name}: {error}")
-            if run["results"]:
-                st.success("Analysis saved for this session. Open the result pages or generate your report.")
-                st.button("Explore satellite & water",on_click=go_page,args=("Satellite & water",))
-
-
 def need_run(run):
     if run:
         st.caption(f"Viewing run {run['id']} · {run['study']['label']} · historical period {run['study']['start']} to {run['study']['end']}")
         return True
-    st.info("Run an analysis first. Each results page uses the saved study boundary and dates.")
-    st.button("Set up your study",type="primary",on_click=go_page,args=("Study & analysis",))
+    st.info("Save a water study first. Each results page uses the saved study boundary and dates.")
+    st.button("Set up your study",type="primary",on_click=go_page,args=("Water study",))
     return False
 
 
@@ -386,7 +239,7 @@ def module_view(run, module, charts=True):
 
 
 def satellite_page(run):
-    banner("Satellite & water","Surface observations, optical screening and areas to investigate.")
+    banner("Satellite water maps","Surface observations, optical screening and areas to investigate.")
     if not need_run(run):
         return
     r = run["results"].get("Satellite",{}).get("raster")
@@ -401,200 +254,9 @@ def satellite_page(run):
         st.caption(f"Actual processed satellite layer · {r['summary']['date']} · {r['resolution']} m common grid. Blank pixels are masked/no data. Golden points are unverified sampling candidates.")
         with st.expander("True-colour view and exportable GIS raster"):
             st.image(raster_png(r,"True colour"),width="stretch")
-            st.download_button("Download all indices as GeoTIFF",geotiff_bytes(r),file_name="aquaterra_satellite_indices.tif",mime="image/tiff")
+            st.download_button("Download all indices as GeoTIFF",geotiff_bytes(r),file_name="hydroscope_satellite_indices.tif",mime="image/tiff")
     module_view(run,"Satellite")
-    st.info("For measured eutrophication indicators, upload field samples on Ecology & field. Satellite indices alone do not establish nutrient concentration, toxicity or drinking-water safety.")
-
-
-def climate_page(run):
-    banner("Climate & air","Historical context and clearly dated model forecasts.")
-    if need_run(run):
-        module_view(run,"Climate")
-        st.divider()
-        module_view(run,"Air quality")
-
-
-def hazards_page(run):
-    banner("Hazards & outlooks","River-flow forecasts, earthquake observations and supported official alerts.")
-    if not need_run(run):
-        return
-    st.warning("AquaTerra is a research workbench. Discharge forecasts are not inundation maps; earthquake event histories do not predict future events.")
-    choice = st.radio("Hazard view",["River outlook","Earthquakes","US weather alerts"],horizontal=True)
-    if choice == "Earthquakes" and choice in run["results"]:
-        show_map(map_for_run(run,["Earthquakes"]),"earthquake-map-"+run["id"])
-        st.caption("Bubble radius follows catalogue magnitude; event depth and magnitude are available on hover. The catalogue may omit smaller events.")
-    module_view(run,choice)
-    st.markdown("Official Pakistan advisories: [PMD](https://www.pmd.gov.pk/) · [NDMA](https://www.ndma.gov.pk/). Official US alerts: [National Weather Service](https://www.weather.gov/).")
-
-
-def ecology_page(run):
-    banner("Ecology & citizen evidence","Connect recorded biodiversity with measurements collected on the ground.")
-    if not need_run(run):
-        return
-    st.subheader("Add field measurements")
-    st.caption("Required columns: site, date, latitude, longitude. Optional measurement names include their units. Use blanks for missing values.")
-    template = ",".join(FIELD_COLUMNS)+"\n"
-    st.download_button("Download blank field CSV template",template,"field_samples_template.csv","text/csv")
-    samples = st.file_uploader("Upload field observations (CSV)",type=["csv"],key="field_csv")
-    lake = st.checkbox("Calculate separate Carlson indices for appropriate lake / reservoir samples",False)
-    if st.button("Validate and attach observations",disabled=samples is None):
-        try:
-            observations = parse_field_csv(samples.getvalue(),run["study"],lake)
-            run["results"]["Field observations"] = observations
-            run["field_updated_utc"] = utc_now()
-            st.session_state["run"] = run
-            st.session_state.pop("exports",None)
-            st.session_state.pop("crew_review",None)
-            st.success("Observations attached to this run. Out-of-area/date rows are retained in the audit table and excluded from analysis.")
-        except DataError as exc:
-            st.error(str(exc))
-    if "Field observations" in run["results"]:
-        if st.button("Remove attached observations"):
-            del run["results"]["Field observations"]
-            st.session_state.pop("exports",None)
-            st.session_state.pop("crew_review",None)
-            st.rerun()
-    show_map(map_for_run(run,["Biodiversity","Field observations","Satellite"]),"ecology-map-"+run["id"])
-    st.caption("Uploaded chlorophyll measurements use proportional bubble areas, capped for readability. Species points show recorded observations; sampling candidates remain unverified.")
-    module_view(run,"Field observations")
-    module_view(run,"Biodiversity")
-
-
-def ai_page(run):
-    st.title("Your five-agent environmental team")
-    st.caption("CrewAI · Sequential workflow · Coordinator, three specialists, then evidence review and report writing.")
-    st.dataframe(pd.DataFrame([{"Agent": role, "Responsibility": description} for _,role,description in AGENT_ROSTER]),
-                 hide_index=True, width="stretch")
-    enabled = ["gemini", "openrouter", "groq"]
-    if secret("ENABLE_OLLAMA", "false").lower() in {"true", "1", "yes"}:
-        enabled.append("ollama")
-    configured = secret("AI_PROVIDER", DEFAULT_PROVIDER).lower()
-    if configured not in enabled:
-        configured = DEFAULT_PROVIDER
-    provider = st.selectbox("AI provider", enabled, index=enabled.index(configured),
-                            format_func=lambda value: PROVIDERS[value]["label"], key="ai_provider")
-    info = PROVIDERS[provider]
-    base_url = secret("OLLAMA_BASE_URL", info["base_url"]) if provider == "ollama" else None
-    with st.expander("AI connection and privacy", expanded=True):
-        key = secret(info["key_name"])
-        if not key and provider != "ollama":
-            key = st.text_input(info["label"] + " API key (private, session only)", type="password",
-                                key="_provider_key_" + provider)
-        if provider == "ollama":
-            st.info("Ollama uses the owner's configured endpoint. On Streamlit Cloud, localhost refers to the cloud server, not your laptop. See LOCAL_OLLAMA.md for a local installation.")
-        model = st.text_input("Model ID", value=secret(info["model_name"], info["model"]), key="model_" + provider)
-        st.caption(info["note"])
-        st.markdown(f"[Provider setup]({info['key_url']}) · [Usage limits]({info['limits_url']})")
-        if provider == "gemini":
-            st.caption("Google's free-tier terms allow submitted data to be used to improve products. Use an appropriate service agreement before sending confidential research data.")
-        def bounded_setting(name, default, minimum, maximum):
-            try:
-                return max(minimum, min(maximum, int(secret(name, str(default)))))
-            except (TypeError, ValueError):
-                return default
-        tokens_per_minute = st.number_input("Estimated token budget per minute", min_value=2000, max_value=1000000,
-            value=bounded_setting("AI_TOKENS_PER_MINUTE", info["tpm"], 2000, 1000000), step=1000, key="tpm_" + provider,
-            help="Set at or below your account's allowance. Input plus reserved output is estimated conservatively. This setting cannot increase your provider quota.")
-        requests_per_minute = st.number_input("Maximum requests per minute", min_value=1, max_value=120,
-            value=bounded_setting("AI_REQUESTS_PER_MINUTE", info["rpm"], 1, 120), key="rpm_" + provider,
-            help="All five agents share this pacing limit. Daily limits and other apps using the same provider project still apply.")
-        connected = bool(key) or provider == "ollama"
-        st.caption("Maps, calculations and standard reports work without an AI key. The selected AI service receives study coordinates, question, summaries and statistics requested by the agents, including some table previews. Whole uploaded files and raw rasters are not sent. Keys are excluded from reports.")
-        if st.button("Test AI connection", disabled=not connected):
-            try:
-                from crew_runtime import ProviderEvidenceLLM, RunBudget
-                with st.spinner("Sending one short connection-test request…"):
-                    llm = ProviderEvidenceLLM(key, model, RunBudget(max_calls=1, seconds=70),
-                        tokens_per_minute=int(tokens_per_minute), provider=provider,
-                        requests_per_minute=int(requests_per_minute), base_url=base_url)
-                    llm.call("Reply with the word CONNECTED. This is a connection test; there is no study data.")
-                st.success("The selected provider returned a usable response. This test used one API request.")
-            except Exception as exc:
-                st.error(str(exc) if type(exc).__name__ == "CrewRunError" else "Connection test failed. Check provider credentials, model access and installed dependencies.")
-        if not connected:
-            st.info(f"Add a private key here or set {info['key_name']} in Streamlit Secrets.")
-    if not need_run(run):
-        return
-    with st.expander("Evidence coverage before AI review"):
-        st.dataframe(pd.DataFrame(quality_findings(run)),hide_index=True,width="stretch")
-    consent = st.checkbox(f"Allow this run's summaries, study coordinates and requested statistics to be sent to {info['label']}",False,key="ai_consent_"+provider)
-    question = st.text_area("Question for the team",value="Assess this study using its saved evidence. If Research validation is available, inspect the recorded statistical tables and validation limitations. Distinguish measured values, satellite indicators and estimates; report missing evidence and practical next steps.",height=120,max_chars=2000)
-    st.caption("The team reviews the saved analysis. Run new environmental analysis to change location, dates or source data. A review can take several minutes while API requests are paced.")
-    force_new = st.checkbox("Generate a fresh review even if a completed review already matches", False,
-                            help="Leave off to reuse the last completed review for identical evidence, question, provider and model.")
-    previous = st.session_state.get("crew_review", {})
-    reusable = (previous.get("status") == "complete" and previous.get("fingerprint") == run_fingerprint(run)
-                and previous.get("question") == question.strip() and previous.get("provider") == provider
-                and previous.get("model") == model)
-    if st.button("Run five-agent review",type="primary",disabled=not consent or not connected or not run["results"]):
-        if not question.strip():
-            st.warning("Enter a question first.")
-        elif reusable and not force_new:
-            st.success("Reused the completed review for this evidence and question; no new API requests were sent.")
-        else:
-            try:
-                import crew_workflow
-                crew_workflow.make_tools = research_agent_tools
-                from crew_workflow import run_team
-                from crew_runtime import CrewRunError
-                with st.status("The five-agent review is running…",expanded=True) as status:
-                    def progress(event):
-                        if event["event"] == "completed":
-                            status.write(f"{event['stage']}/5 complete — {event['role']}")
-                        elif event["event"] == "rate_pause":
-                            status.update(label=f"Pacing API requests — approximately {event['seconds']} seconds until the next slot")
-                        elif event["event"] == "model_request":
-                            status.update(label=f"Review in progress — model request {event['call']}")
-                    # CrewAI may invoke callbacks on its own worker threads.
-                    # Only the Streamlit script thread may update the interface.
-                    events = queue.Queue()
-                    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="aquaterra-review") as pool:
-                        future = pool.submit(run_team,run,question.strip(),key,model,int(tokens_per_minute),events.put,
-                                             provider=provider,requests_per_minute=int(requests_per_minute),base_url=base_url)
-                        while not future.done():
-                            try:
-                                progress(events.get(timeout=.15))
-                            except queue.Empty:
-                                pass
-                        while not events.empty():
-                            progress(events.get_nowait())
-                        review = future.result()
-                    status.update(label="Five-agent review complete" if review["status"] == "complete" else "Review stopped; partial notes retained",
-                                  state="complete" if review["status"] == "complete" else "error",expanded=False)
-                st.session_state["crew_review"] = review
-                st.session_state.pop("exports",None)
-            except ImportError:
-                st.error("CrewAI is not installed correctly. Upload this package's requirements.txt and all Python files, then reboot the app.")
-            except (DataError, ValueError) as exc:
-                st.error(str(exc))
-            except Exception as exc:
-                st.error(str(exc) if type(exc).__name__ == "CrewRunError" else "The AI team could not start. Check the supplied files, dependency versions and AI provider settings. Environmental results are preserved.")
-    reply = st.session_state.get("crew_review")
-    if reply and reply.get("fingerprint") != run_fingerprint(run):
-        st.info("The saved AI review belongs to different evidence. Run the team again for this analysis.")
-    elif reply:
-        if reply["status"] == "complete":
-            st.markdown(reply["answer"])
-            st.success("All five agents completed. The AI narrative can now be included under Reports & sources.")
-        else:
-            st.warning(reply.get("error", "The AI review did not complete."))
-            st.caption("These are partial agent notes, not a completed final review.")
-        st.caption("AI-generated interpretation. The reviewer checks available evidence but does not independently validate scientific accuracy. Verify cited findings before sharing.")
-        for note in reply.get("agent_outputs",[]):
-            with st.expander(note["role"]):
-                st.markdown(note["text"])
-        with st.expander("Team activity and request usage"):
-            st.write({"provider":reply.get("provider"),"requested_model":reply.get("model"),"returned_models":reply.get("actual_models",[])})
-            st.json(reply.get("usage",{}))
-            st.dataframe(pd.DataFrame(reply.get("activity",[])),hide_index=True,width="stretch")
-        st.download_button("Download agent review and activity",json.dumps(reply,indent=2,ensure_ascii=False),
-                           "aquaterra_five_agent_review.json","application/json")
-        if reply["status"] == "complete":
-            st.download_button("Download final AI narrative",reply["answer"],"aquaterra_ai_review.md","text/markdown")
-    st.subheader("Evidence available without AI")
-    for r in run["results"].values():
-        for fact in r["facts"]:
-            st.write(fact)
+    st.info("For measured eutrophication indicators, upload field samples in Water research → Field data. Satellite indices alone do not establish nutrient concentration, toxicity or drinking-water safety.")
 
 
 @st.cache_resource
@@ -602,110 +264,15 @@ def report_lock():
     return threading.Lock()
 
 
-def reports_page(run):
-    st.title("Reports & source records")
-    st.caption("A shareable report, full data tables and GIS-ready layers from the same saved analysis.")
-    if not need_run(run):
-        return
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Completed modules",len(run["results"]))
-    c2.metric("Data tables",len(all_tables(run)))
-    c3.metric("Source records",len(all_sources(run)))
-    st.write("The report includes findings, maps, charts, table previews, methods, limitations and source records. The complete ZIP includes every returned table, PNG figures, GeoJSON, metadata and a GeoTIFF when satellite processing succeeds.")
-    review = st.session_state.get("crew_review")
-    include_ai = False
-    if review_is_current(run,review):
-        include_ai = st.checkbox("Include the completed five-agent AI review",value=True)
-    else:
-        st.caption("Run the team under AI team to add a completed AI narrative. The standard evidence report is available now.")
-    export_run = {**run, "crew_review": review} if include_ai else run
-    export_key = (run_fingerprint(run), review.get("generated_utc") if include_ai else None)
-    if st.button("Generate report & export package",type="primary",width="stretch"):
-        try:
-            with st.spinner("Rendering charts, maps, PDF and workbook…"):
-                with report_lock():
-                    exports = build_exports(export_run)
-            st.session_state["exports"] = {"run":run["id"],"export_key":export_key,"files":exports}
-        except Exception as exc:
-            st.error(f"Export could not complete ({type(exc).__name__}). Your analysis is still available. Individual CSV and GeoTIFF downloads can be used while the report issue is resolved.")
-    bundle = st.session_state.get("exports")
-    if bundle and bundle.get("export_key") == export_key:
-        ex = bundle["files"]
-        c1,c2,c3,c4 = st.columns(4)
-        suffix = run["id"]
-        c1.download_button("Complete ZIP",ex["zip"],f"aquaterra_{suffix}.zip","application/zip",width="stretch",type="primary")
-        c2.download_button("PDF report",ex["pdf"],f"aquaterra_{suffix}.pdf","application/pdf",width="stretch")
-        c3.download_button("HTML report",ex["html"],f"aquaterra_{suffix}.html","text/html",width="stretch")
-        c4.download_button("Excel data",ex["xlsx"],f"aquaterra_{suffix}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch")
-        st.success("Exports are ready. Download them before ending the session; this MVP does not provide a persistent project database.")
-    lab=st.session_state.get("research_"+run["id"])
-    if lab and lab.get("records"):
-        st.info("This study also has recorded research analyses. Their figures, processed raster windows and offline replay code are in Research workspace → Methods & downloads.")
-        st.button("Open research methods and downloads",on_click=go_page,args=("Research workspace",))
-    st.subheader("Provenance")
-    st.dataframe(pd.DataFrame(all_sources(run)),width="stretch",hide_index=True)
-    st.download_button("Download run metadata",json.dumps(plain_metadata(run),indent=2,default=str),"metadata.json","application/json")
-    if run["errors"]:
-        st.subheader("Unavailable modules")
-        for module,error in run["errors"].items():
-            st.warning(f"{module}: {error}")
-    with st.expander("Data access, attribution and operational limits"):
-        st.write("Open-Meteo hosted free access is for non-commercial use and has quotas. Include attribution to Open-Meteo and the underlying data providers. Sentinel imagery: Copernicus Sentinel data via Earth Search. GBIF records retain contributor and licence fields. Maps: © OpenStreetMap contributors. ")
-        st.write("The app caches public provider responses and limits retries and satellite processing. Satellite scenes may be old or cloudy, and coarse model grids cannot resolve every local condition. Baselines, forecasts and observations are labelled separately.")
-        st.write("Scope: bounded-area research MVP. Persistent multi-user projects, validated local flood models, calibrated water-quality concentrations and autonomous emergency alerts require additional infrastructure and validation.")
-        st.markdown("[Open-Meteo terms](https://open-meteo.com/en/terms) · [Open-Meteo pricing/access](https://open-meteo.com/en/pricing) · [OpenStreetMap attribution](https://www.openstreetmap.org/copyright)")
-
-
-def main():
-    st.set_page_config(page_title="AquaTerra Research AI | Environmental intelligence",layout="wide",initial_sidebar_state="expanded")
-    inject_theme()
-    for key,value in {"study_label":"Rawal Lake, Islamabad","study_lat":33.700,"study_lon":73.120,"page":"Overview","use_boundary":False}.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-    with st.sidebar:
-        st.html("<div class='eco-brand'><div><strong>AquaTerra <span style='color:#72E2C9'>Research AI</span></strong><small>Water · Ecology · Climate</small></div></div>")
-        page = st.radio("Workspace",list(PAGES[:-2])+["Research workspace"]+list(PAGES[-2:]),key="page",label_visibility="collapsed")
-        st.divider()
-        run = st.session_state.get("run")
-        if run:
-            st.caption("SAVED ANALYSIS")
-            st.markdown(f"**{run['study']['label']}**")
-            st.caption(f"{run['study']['start']} → {run['study']['end']}")
-            st.caption(f"{len(run['results'])} modules · {len(run['errors'])} unavailable")
-            st.caption("Retrieved times appear in source records.")
-        else:
-            st.caption("READY WHEN YOU ARE")
-            st.write("Begin with a place and a question.")
-        st.divider()
-        st.caption(f"{APP_RELEASE} · CrewAI · 5 agents")
-        st.caption("Open data • Reproducible methods • Clear uncertainty")
-    c1, c2, c3 = st.columns([2.6, 1, 1])
-    c1.caption(f"AQUATERRA RESEARCH AI {APP_RELEASE} · {page}")
-    c2.button("AI team", width="stretch", key="always-ai", on_click=go_page, args=("AI team",))
-    c3.button("Study setup", width="stretch", key="always-study", on_click=go_page, args=("Study & analysis",))
-    if run and run.get("version") != VERSION:
-        st.warning("This saved analysis was generated by an earlier app version. Run environmental analysis again before using the new AI team and reports.")
-        run = None
-    if page == "Overview": overview(run)
-    elif page == "Study & analysis": study_page()
-    elif page == "Satellite & water": satellite_page(run)
-    elif page == "Climate & air": climate_page(run)
-    elif page == "Hazards": hazards_page(run)
-    elif page == "Ecology & field": ecology_page(run)
-    elif page == "Research workspace": research_page(run)
-    elif page == "AI team": ai_page(run)
-    else: reports_page(run)
-
-
-
-
 # RESEARCH_ENGINE_START
 # This exact block is included in the offline reproduction package.
-RESEARCH_ENGINE_VERSION = "2026.09.30.1"
+RESEARCH_ENGINE_VERSION = "2026.10.05.water.1"
 RESEARCH_NUMERIC = ["chlorophyll_ug_l", "turbidity_ntu", "secchi_m", "temperature_c",
     "total_phosphorus_ug_l", "total_nitrogen_mg_l", "dissolved_oxygen_mg_l", "ph",
-    "phycocyanin_ug_l", "cyanobacteria_cells_ml"]
+    "phycocyanin_ug_l", "cyanobacteria_cells_ml", "salinity_psu", "conductivity_us_cm"]
 RESEARCH_METHODS = {
+    "trophic": "Separate natural-log Carlson indices from measured lake/reservoir chlorophyll, Secchi depth and phosphorus; explicit applicability confirmation required.",
+    "water_summary": "Observed per-site descriptive statistics and per-site monthly means. No gap filling, spatial extrapolation or inferential test.",
     "clean": "Row audit; explicit column mapping and units; UTC conversion; invalid numeric cells become missing and are recorded. No outlier removal or imputation.",
     "correlation": "Pearson product-moment and Spearman average-rank correlation. Optional permutation inference and paired percentile bootstrap assume independent rows; BH adjustment is across the displayed tests.",
     "regression": "Intercept plus ordinary least-squares or penalized additive cubic regression splines (Gaussian response, identity link). Complete cases; no automated variable selection. Split by entire groups before fitting/scaling/knots.",
@@ -950,9 +517,57 @@ def research_community(frame,s):
         "plots":[{"kind":"bar","table":"Community diversity","x":"sample_id","y":"shannon_ln","title":"Phytoplankton diversity (natural-log Shannon)"}]}
 
 
+def research_trophic(frame, settings):
+    if settings.get("waterbody_type") not in ("Lake", "Reservoir") or not settings.get("confirmed"):
+        raise ValueError("Carlson TSI requires an explicitly confirmed freshwater lake/reservoir application.")
+    out=frame[[c for c in ("sample_id","site","date") if c in frame]].copy()
+    equations={"chlorophyll_ug_l":(9.81,30.6,"tsi_chlorophyll"),"secchi_m":(-14.41,60.0,"tsi_secchi"),
+               "total_phosphorus_ug_l":(14.42,4.15,"tsi_phosphorus")}
+    for source,(slope,intercept,target) in equations.items():
+        if source in frame:
+            values=pd.to_numeric(frame[source],errors="coerce")
+            out[source]=values
+            out[target]=slope*np.log(values.where(values>0))+intercept
+    if not any(c.startswith("tsi_") for c in out):
+        raise ValueError("Provide measured chlorophyll-a, Secchi depth or total phosphorus in the stated units.")
+    notes=["Measured-input Carlson indices, calculated separately; no composite/average trophic score.",
+           "TSI(Chl)=9.81 ln(Chl µg/L)+30.6; TSI(SD)=60−14.41 ln(SD m); TSI(TP)=14.42 ln(TP µg/L)+4.15.",
+           "Only positive measurements yield an index. Applicability is user-confirmed, not independently validated.",
+           "Non-algal turbidity, water colour, depth, nutrient limitation and unusual optical conditions can invalidate interpretation. Not a cyanobacterial/toxin or water-safety test.",
+           "Reference: Carlson (1977); https://www.nalms.org/secchidipin/monitoring-methods/trophic-state-equations/"]
+    return {"tables":{"Measured trophic indices":out},"notes":notes,"plots":[]}
+
+
+def research_water_summary(frame, settings):
+    columns=[c for c in settings.get("columns",[]) if c in RESEARCH_NUMERIC and c in frame]
+    if not columns:raise ValueError("Select measured water-quality variables.")
+    f=frame.copy();f["date"]=pd.to_datetime(f.date,utc=True,errors="coerce")
+    f["month"]=f.date.dt.strftime("%Y-%m")
+    site_rows=[];month_rows=[];tables={};plots=[]
+    for c in columns:
+        f[c]=pd.to_numeric(f[c],errors="coerce")
+        for site,g in f.groupby("site",sort=True):
+            vals=g[c].dropna()
+            site_rows.append({"site":site,"variable":c,"n":len(vals),"mean":vals.mean(),"median":vals.median(),
+                              "sd":vals.std(ddof=1),"min":vals.min(),"max":vals.max()})
+        for (site,month),g in f.groupby(["site","month"],sort=True):
+            vals=g[c].dropna()
+            month_rows.append({"site":site,"month":month,"variable":c,"n":len(vals),"mean":vals.mean(),"median":vals.median()})
+        name="Observed "+c
+        tables[name]=f[[c for c in ("sample_id","site","date",c) if c in f]].copy()
+        plots.append({"kind":"scatter","table":name,"x":"date","y":c,"group":"site","title":"Observed "+c+"; no gap filling"})
+    tables["Site descriptive statistics"]=pd.DataFrame(site_rows)
+    tables["Monthly observed means"]=pd.DataFrame(month_rows)
+    return {"tables":tables,"plots":plots,"notes":[
+        "Per-site descriptive statistics and observed monthly means. Unequal sampling and missing months remain explicit; no spatial interpolation or area weighting.",
+        "Site differences are descriptive, not proof of significance or causation. Temporal coverage follows actual sampling, not the entire selected date range."]}
+
+
 def research_compute(action, frame, settings):
     s=settings;rng=np.random.default_rng(int(s.get("seed",42)))
     if action=="clean": return research_clean(frame,s)
+    if action=="trophic": return research_trophic(frame,s)
+    if action=="water_summary": return research_water_summary(frame,s)
     if action=="regression": return research_regression(frame,s)
     if action=="community": return research_community(frame,s)
     notes=[];plots=[];tables={}
@@ -1102,18 +717,31 @@ def research_state(run):
 def research_attach(run,lab):
     from environment import result,source_record
     out=result("Research validation")
-    out["sources"]=[source_record("R1","AquaTerra research engine / user-supplied measurements","Calculated research results",
+    out["sources"]=[source_record("R1","HydroScope research engine / user-supplied measurements","Calculated research results",
         utc_now(),f"{run['study']['start']} to {run['study']['end']}","Sample-level; match quality is explicit",
         "Executed Python analyses with recorded inputs, settings and methods. Field quality is not independently verified.")]
     out["notes"]=["Satellite indices are dimensionless; field concentrations remain separately labelled. No automatic toxicity or bloom probability.",
-        "Each calculation has its own audit record and input snapshot. Agent completion does not constitute scientific validation.",
+        "Each calculation has its own audit record and input snapshot. An AI explanation does not constitute scientific validation.",
         "Statistical inference is unavailable unless the user declares independent sampling units. Review repeated sites/dates."]
-    for rec in lab["records"][-12:]:
+    for rec in lab["records"]:
         for title,df in rec["output"]["tables"].items():out["tables"][rec["id"]+" "+title]=df
+        out["notes"].append(f"{rec['id']} method: {rec['method']}")
+        out["notes"].extend(f"{rec['id']}: {n}" for n in rec["output"].get("notes",[]))
         out["facts"].append(f"[R1] {rec['id']}: {rec['action']} executed on {len(rec['input'])} rows. See the associated tables and recorded limitations; execution is not evidence of accuracy.")
     out["metrics"]={"Executed research analyses":len(lab["records"]),"Uploaded reference observations":len(lab["field"]) if lab["field"] is not None else 0}
     run["results"]["Research validation"]=out
-    st.session_state.pop("crew_review",None);st.session_state.pop("exports",None)
+    if lab["field"] is not None:
+        f=lab["field"].copy()
+        field=result("Field observations")
+        field["tables"]={"Field observations audit":f,"Included field observations":f.loc[f.included].copy()}
+        field["metrics"]={"Included field observations":int(f.included.sum())}
+        field["facts"]=[f"[U1] {int(f.included.sum())}/{len(f)} uploaded samples pass basic inclusion checks; laboratory accuracy is unverified."]
+        field["sources"]=[source_record("U1","User-supplied field measurements","Unverified reference observations",utc_now(),
+            f"{run['study']['start']} to {run['study']['end']}","Sample coordinates; spatial support and sampling depth vary",
+            "Explicit column/unit mapping, local-date inclusion and UTC conversion. Missing coordinates remain available for nonspatial statistics; no imputation.")]
+        field["notes"]=["Measurements are user-supplied, not independently verified. Spectral indices are not measured concentrations."]
+        run["results"]["Field observations"]=field
+    st.session_state.pop("interpretation",None);st.session_state.pop("exports",None)
     lab.pop("download",None)
 
 
@@ -1185,15 +813,16 @@ def research_plot(spec,tables):
     else:
         group=spec.get("group")
         if group and group in f:
-            for label,d in f.groupby(group,dropna=False):ax.scatter(pd.to_numeric(d[x],errors="coerce"),pd.to_numeric(d[y],errors="coerce"),s=24,alpha=.8,label=str(label))
+            for label,d in f.groupby(group,dropna=False):ax.scatter((pd.to_datetime(d[x],utc=True,errors="coerce") if x=="date" else pd.to_numeric(d[x],errors="coerce")),pd.to_numeric(d[y],errors="coerce"),s=24,alpha=.8,label=str(label))
             ax.legend(frameon=False,fontsize=8)
-        else:ax.scatter(pd.to_numeric(f[x],errors="coerce"),pd.to_numeric(f[y],errors="coerce"),s=25,color="#087f8c",alpha=.8)
+        else:ax.scatter((pd.to_datetime(f[x],utc=True,errors="coerce") if x=="date" else pd.to_numeric(f[x],errors="coerce")),pd.to_numeric(f[y],errors="coerce"),s=25,color="#087f8c",alpha=.8)
         if spec.get("one_to_one"):
             values=f[[x,y]].apply(pd.to_numeric,errors="coerce").to_numpy();values=values[np.isfinite(values)]
             if len(values):ax.plot([values.min(),values.max()],[values.min(),values.max()],"--",color="#725c92",linewidth=1,label="1:1")
+    if x=="date":fig.autofmt_xdate()
     ax.set(xlabel=x,ylabel=y,title=spec["title"]);ax.grid(alpha=.2)
     ax.spines[["top","right"]].set_visible(False)
-    fig.text(.01,.002,"AquaTerra | source and methods in accompanying audit record",fontsize=7,color="#444444")
+    fig.text(.01,.002,"HydroScope | source and methods in accompanying audit record",fontsize=7,color="#444444")
     return fig
 
 
@@ -1426,12 +1055,12 @@ def research_function_source(name):
     raise ValueError("Replay function is unavailable: "+name)
 
 
-def research_package(run,lab):
+def research_package(run,lab,include_interpretation=True):
     import importlib.metadata
     source=Path(__file__).read_text(encoding="utf-8")
     engine=source.split("# RESEARCH_ENGINE_START\n",1)[1].split("# RESEARCH_ENGINE_END",1)[0]
     manifest={"application":APP_RELEASE,"engine":RESEARCH_ENGINE_VERSION,"study":run["study"],"created_utc":utc_now(),"records":[],"files":{},"snapshots":[]}
-    content={};report=["# AquaTerra research report","",f"Study: {run['study']['label']}",
+    content={};report=["# HydroScope research report","",f"Study: {run['study']['label']}",
         "Satellite estimates are not field measurements. Statistical outputs require review of sampling design and optical limitations.",
         "This export includes exact executed scientific code and input snapshots. AI text may vary on a fresh provider call; numerical analyses can be rerun offline."]
     def add(path,data):
@@ -1472,10 +1101,9 @@ def research_package(run,lab):
             for extension in ("png","svg","pdf"):
                 b=io.BytesIO();fig.savefig(b,format=extension,dpi=300,bbox_inches="tight");add(f"{root}/figure_{j+1}.{extension}",b.getvalue())
             plt.close(fig)
-    for name in ("app.py","environment.py","evidence.py","crew_config.py","crew_workflow.py","agent_tools.py","agent_common.py","crew_runtime.py","crewai_compat.py","ai_providers.py","requirements.txt","METHODS.md","RESEARCH_METHODS.md","AI_PROVIDERS.md"):
+    for name in ("app.py","environment.py","evidence.py","water_data.py","interpretation.py","ai_providers.py","requirements.txt","METHODS.md","RESEARCH_METHODS.md","AI_PROVIDERS.md"):
         p=Path(__file__) if name=="app.py" else ROOT/name
         if p.is_file():add("source/"+name,p.read_bytes())
-    for p in (ROOT/"agents").glob("*.py"):add("source/agents/"+p.name,p.read_bytes())
     deps=[]
     for name in ("numpy","pandas","matplotlib","shapely","pyproj","affine"):
         try:deps.append(f"{name}=={importlib.metadata.version(name)}")
@@ -1536,8 +1164,8 @@ print("Done. Results are in",out)
     add("research_report.md","\n\n".join(report))
     audit=[{k:v for k,v in rec.items() if k not in ("input","output")} for rec in lab["records"]]
     add("execution_log.json",research_json(audit))
-    review=st.session_state.get("crew_review")
-    if review_is_current(run,review):add("ai_review.json",research_json(review))
+    review=st.session_state.get("interpretation")
+    if include_interpretation and interpretation_is_current(run,review):add("ai_interpretation.json",research_json(review))
     add("sampling_points.geojson",research_json({"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[p["longitude"],p["latitude"]]},"properties":{"site":p["site"],"status":"Planned location; no implied measurement"}} for p in lab["points"]]}))
     add("study_boundary.geojson",research_json(run["study"]["geometry"]))
     # Manifest is written last and intentionally does not checksum itself.
@@ -1551,13 +1179,14 @@ print("Done. Results are in",out)
 
 def research_field_page(run,lab):
     st.subheader("Original field measurements")
-    st.download_button("Download blank Excel template",research_template(),"aquaterra_research_template.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption("Freshwater and marine samples: upload observations before using statistics or interpretation.")
+    st.download_button("Download blank Excel template",research_template(),"hydroscope_research_template.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     upload,frame=research_upload_widget("Upload field workbook or CSV","research_field_file")
     if frame is not None:
         st.dataframe(frame.head(8),hide_index=True,width="stretch")
         with st.expander("Map columns and confirm units",expanded=True):
             mapping_columns=research_mapping(frame,["sample_id","site","date","latitude","longitude","depth_m",*RESEARCH_NUMERIC,"laboratory_method","quality_note"],"fieldmap",("site","date"))
-            st.caption("Units: chlorophyll/phycocyanin/phosphorus µg/L; nitrogen/oxygen mg/L; turbidity NTU; Secchi/depth m; temperature °C. Mapping a column does not convert its units.")
+            st.caption("Units: chlorophyll/phycocyanin/phosphorus µg/L; nitrogen/oxygen mg/L; turbidity NTU; Secchi/depth m; temperature °C; salinity PSU; conductivity µS/cm. Mapping a column does not convert its units.")
             c1,c2,c3=st.columns(3)
             tz=c1.selectbox("Timezone for dates without UTC offset",["UTC","Asia/Karachi","Asia/Shanghai","Asia/Kolkata","Europe/London","America/New_York"])
             dayfirst=c2.checkbox("Day comes before month",False)
@@ -1595,10 +1224,28 @@ def research_field_page(run,lab):
                 show_map(m,"research_field_map")
                 st.caption("Bubble area follows magnitude with a display cap; it is a measured-data display, not a continuous concentration surface.")
 
+        st.divider()
+        st.markdown("**Record water-quality summaries for the report**")
+        selected=st.multiselect("Measurements to summarise",values,default=values[:4],key="summary_vars")
+        if st.button("Calculate site and monthly summaries",disabled=not selected):
+            research_record(run,lab,"water_summary",f.loc[f.included].copy(),{"columns":selected})
+            st.success("Site statistics, monthly summaries and plots added to the evidence and downloads.")
+        if run["study"].get("waterbody_type") in ("Lake","Reservoir"):
+            confirmed=st.checkbox("This is an appropriate freshwater lake/reservoir application of Carlson TSI",value=False)
+            st.caption("Do not use for marine/brackish water, rivers, or sediment-driven transparency without a justified method. Indices are computed separately and never averaged.")
+            if st.button("Calculate measured trophic indicators",disabled=not confirmed):
+                research_record(run,lab,"trophic",f.loc[f.included].copy(),{"waterbody_type":run["study"]["waterbody_type"],"confirmed":confirmed})
+                st.success("Measured trophic indicators added. Inspect Methods & downloads for the formula and limitations.")
+        else:
+            st.caption("Carlson lake trophic indices are disabled for rivers and sea/coastal studies.")
+
+        recent=[r for r in lab["records"] if r["action"] in ("water_summary","trophic")]
+        if recent:research_show_record(recent[-1])
+
 
 def research_sites_page(run,lab):
-    st.subheader("Reservoir and sampling points")
-    st.write("Change the reservoir boundary in Study & analysis. Here, click the map and save a named planned sampling point.")
+    st.subheader("Waterbody and sampling points")
+    st.write("Change the waterbody boundary in Water study. Here, click the map and save a named planned sampling point.")
     m=base_map(run["study"])
     for p in lab["points"]:folium.CircleMarker([p["latitude"],p["longitude"]],radius=6,color="#c48622",fill=True,tooltip=html.escape(p["site"]+" — planned")).add_to(m)
     response=show_map(m,"research_site_editor",height=500,interactive=True)
@@ -1652,7 +1299,7 @@ def research_geotiff(raster):
 def research_satellite_page(run,lab):
     st.subheader("Satellite observations and field matchups")
     sensor=st.selectbox("Satellite source",["Sentinel-2","Landsat 8/9 temperature","Sentinel-1 catalogue"])
-    if sensor=="Sentinel-1 catalogue":st.info("This single-file version provides Sentinel-1 acquisition footprints and metadata. SAR water classification and flood modelling are not implemented here.")
+    if sensor=="Sentinel-1 catalogue":st.info("This version provides Sentinel-1 acquisition footprints and metadata. SAR water classification and flood modelling are not implemented here.")
     elif sensor=="Sentinel-2":st.caption("NDCI and red reflectance remain uncalibrated indicators. No universal chlorophyll, turbidity or cyanobacteria conversion is applied.")
     else:st.caption("Landsat 8/9 Collection 2 surface temperature, water and cloud QA, with ST uncertainty filtering. Output grid is at least 120 m; narrow waters may be unresolved.")
     a,b,c=st.columns(3)
@@ -1825,10 +1472,10 @@ def research_models_page(run,lab):
     with zipfile.ZipFile(b,"w",zipfile.ZIP_DEFLATED) as z:
         z.writestr("study.json",research_json(run["study"]))
         if lab["field"] is not None:z.writestr("field_observations.csv",safe_frame(lab["field"]).to_csv(index=False))
-        for mod in ("Climate","River outlook"):
+        for mod in ("River outlook","Marine outlook"):
             for title,f in run["results"].get(mod,{}).get("tables",{}).items():z.writestr(re.sub(r"\W+","_",mod+"_"+title)+".csv",safe_frame(f).to_csv(index=False))
         z.writestr("README.txt",f"Generic study-data exchange for {model}. Not a runnable model project. Preserve units and distinguish forecasts from observations. Configure and validate the external solver separately.")
-    st.download_button("Export study data for external modelling",b.getvalue(),"aquaterra_model_data.zip","application/zip")
+    st.download_button("Export study data for external modelling",b.getvalue(),"hydroscope_model_data.zip","application/zip")
     upload,frame=research_upload_widget("Import saved external model outputs","research_model_outputs")
     if frame is not None:
         st.dataframe(frame.head(15),hide_index=True,width="stretch")
@@ -1841,8 +1488,8 @@ def research_models_page(run,lab):
                 f=frame.copy();f["date"]=pd.to_datetime(f.date,utc=True,errors="raise").astype(str)
                 f["value"]=pd.to_numeric(f.value,errors="raise")
                 if f[list(required)].isna().any().any() or not np.isfinite(f.value).all():raise ValueError("Model outputs contain missing or non-finite required values.")
-                f["model"]=model;f["model_version_run"]=version.strip();f["status"]="External model estimate; calibration not verified by AquaTerra"
-                output={"tables":{"Imported model outputs":f},"notes":["Imported from an external simulator. AquaTerra did not execute or verify the solver or its calibration."],"plots":[]}
+                f["model"]=model;f["model_version_run"]=version.strip();f["status"]="External model estimate; calibration not verified by HydroScope"
+                output={"tables":{"Imported model outputs":f},"notes":["Imported from an external simulator. HydroScope did not execute or verify the solver or its calibration."],"plots":[]}
                 research_record(run,lab,"external_model_import",f,{"model":model,"version_run":version,"method":"Import and validate output schema; no simulation executed"},output)
                 lab["uploads"]["model_"+re.sub(r"[^a-zA-Z0-9_.-]","_",upload.name)]=upload.getvalue()
                 st.success("External estimates attached with their provenance label.")
@@ -1853,7 +1500,7 @@ def research_models_page(run,lab):
 
 def research_audit_page(run,lab):
     st.subheader("Execution record and reproducibility")
-    st.write("Each record links a source snapshot, processing settings, calculation, result and limitations. These are actual function executions. AI interpretations remain separately labelled under AI team.")
+    st.write("Each record links a source snapshot, processing settings, calculation, result and limitations. These are actual function executions. AI interpretations remain separately labelled on AI interpretation.")
     if lab["records"]:
         st.dataframe(pd.DataFrame([{"record":r["id"],"calculation":r["action"],"input_rows":len(r["input"]),"executed_utc":r["executed_utc"],"input_hash":r["input_sha256"][:16]} for r in lab["records"]]),hide_index=True,width="stretch")
         selected=st.selectbox("Inspect a recorded analysis",[r["id"] for r in lab["records"]])
@@ -1864,14 +1511,14 @@ def research_audit_page(run,lab):
                     with report_lock():lab["download"]=research_package(run,lab)
                 st.success("Research package is ready.")
             except Exception as exc:st.error(f"Export stopped: {str(exc)[:300]}")
-        if lab.get("download"):st.download_button("Download research package",lab["download"],"aquaterra_reproducible_research.zip","application/zip",type="primary")
+        if lab.get("download"):st.download_button("Download research package",lab["download"],"hydroscope_reproducible_research.zip","application/zip",type="primary")
     else:st.info("Execute a field-data check or research analysis to create an inspectable record.")
     st.caption("The package includes original uploads, processed tables, 300 dpi PNG and vector figures, methods, settings, source code and an offline reproduce.py. Satellite matching can be repeated from saved processed windows; full atmospheric processing is not claimed to be reproducible from those windows alone.")
-    st.caption("Use Reports & sources for the original environmental PDF/Excel exports and AI briefing. This research workspace has its own detailed package. Scientific suitability depends on independent measurements and review; attractive figures alone do not establish publication validity.")
+    st.caption("Use Reports & sources for the original water PDF/Excel exports and optional AI interpretation. This research workspace has its own detailed package. Scientific suitability depends on independent measurements and review; attractive figures alone do not establish publication validity.")
 
 
 def research_page(run):
-    banner("Research workspace","Field validation, ecological communities and methods you can inspect.")
+    banner("Water research","Field validation, phytoplankton communities and methods you can inspect.")
     if not need_run(run):return
     lab=research_state(run)
     section=st.radio("Research tools",["Field data","Sampling points","Satellite matchups","Statistics","Phytoplankton","External models","Methods & downloads"],horizontal=True,key="research_section")
@@ -1884,30 +1531,255 @@ def research_page(run):
 
 
 
-def research_agent_tools(store,domain,activity):
-    from crewai_compat import tool
-    def record(name,args,payload):
-        text=research_json(payload)
-        activity.append({"agent":domain,"event":"tool","tool":name,"arguments":args,
-            "output_sha256":hashlib.sha256(text.encode()).hexdigest(),"result":text[:5000],
-            "result_truncated":len(text)>5000,"executed_utc":utc_now()})
-        return text
-    @tool("read_evidence")
-    def read_evidence(module: str="all") -> str:
-        """Read actual source IDs, calculated facts, limitations and table names in this agent's scope."""
-        payload=store.evidence(domain,module)
-        if len(research_json(payload))>10000:payload=store.evidence(domain,module,compact=True)
-        return record("read_evidence",{"module":module},payload)
-    @tool("table_statistics")
-    def table_statistics(module: str,table: str,column: str,operation: str="mean") -> str:
-        """Calculate a supported summary from a saved numeric evidence table; no generated or assumed data."""
-        args={"module":module,"table":table,"column":column,"operation":operation}
-        return record("table_statistics",args,store.statistics(domain,module,table,column,operation))
-    @tool("quality_checks")
-    def quality_checks() -> str:
-        """Read computed study coverage, missing-evidence and scope checks."""
-        return record("quality_checks",{},store.check_scope(domain))
-    return [read_evidence,table_statistics,quality_checks]
 
-if __name__ == "__main__":
+def overview(run):
+    st.html("""<div class='eco-hero' style='background:linear-gradient(125deg,#0c3947,#12263c)'>
+    <div class='eyebrow'>HydroScope Water Research</div><h1>Understand your water.<br>Inspect the evidence.</h1>
+    <p>A focused workspace for rivers, lakes, reservoirs and coastal seas. Bring field measurements
+    and satellite observations together, test relationships and export methods you can reproduce.</p>
+    <span class='pill'>Water quality</span><span class='pill'>Field validation</span><span class='pill'>Reproducible research</span></div>""")
+    for col, text, page in zip(st.columns(3),["Define a water study","Upload field measurements","Interpret computed results"],
+                               ["Water study","Water research","AI interpretation"]):
+        col.button(text,on_click=go_page,args=(page,),width="stretch")
+    st.write("All calculations run in Python. The optional AI interpreter explains saved results in one request; it does not select methods, fetch data or run analyses.")
+    st.dataframe(pd.DataFrame([
+        {"Workspace":"Satellite water maps","What it provides":"Sentinel-2 water masks, NDCI and red-reflectance screening; real acquisition dates and clear-area coverage."},
+        {"Workspace":"Water research","What it provides":"Excel/CSV cleaning, sites, satellite matchups, measured water quality, correlations, regression/GAM, PCA/RDA, clustering and seasonality."},
+        {"Workspace":"Phytoplankton","What it provides":"Species/genus abundance, diversity, community relationships and exploratory grouping."},
+        {"Workspace":"River & marine","What it provides":"Modelled river discharge or sea-surface temperature, waves, currents and sea level; distinct from measurements."},
+        {"Workspace":"Reports & sources","What it provides":"PDF/HTML, Excel/CSV, map layers, scientific figures and research replay code."},
+    ]),hide_index=True,width="stretch")
+    st.info("Satellite screening is not a measured chlorophyll or turbidity concentration. Field validation, appropriate sampling design and researcher review remain necessary.")
+    if run:
+        cols=st.columns(3)
+        cols[0].metric("Waterbody",run["study"]["waterbody_type"])
+        cols[1].metric("Evidence modules",len(run["results"]))
+        cols[2].metric("Source records",len(all_sources(run)))
+    st.caption("No decorative images or custom icons. Scientific maps and plots display actual retrieved or uploaded data; no demonstration data are inserted into your study.")
+
+
+def study_page():
+    from water_data import WATERBODY_TYPES, available_modules
+    st.title("Define your water study")
+    st.caption("Choose the waterbody, inspect the boundary and save the study before uploading field data.")
+    left,right=st.columns([1,1.5],gap="large")
+    with left:
+        kind=st.selectbox("Waterbody type",WATERBODY_TYPES,index=2,key="waterbody_kind")
+        with st.expander("Find a river, lake, reservoir or coastal place"):
+            query=st.text_input("Place name",placeholder="Min River, Fujian")
+            st.caption("OpenStreetMap place search is user-triggered and cached. A name returns a reference point, not the complete waterbody boundary.")
+            if st.button("Search waterbody"):
+                if len(query.strip())<3:st.warning("Enter at least three characters.")
+                else:
+                    try:st.session_state["places"]=landmark_search(query.strip())
+                    except DataError as exc:st.error(str(exc))
+            places=st.session_state.get("places",[])
+            if places:
+                ix=st.selectbox("Matching places",range(len(places)),format_func=lambda i:places[i]["label"])
+                if st.button("Use selected location"):
+                    p=places[ix]
+                    st.session_state.update({"study_label":p["label"],"study_lat":p["lat"],"study_lon":p["lon"],"use_boundary":False})
+        label=st.text_input("Study name",key="study_label")
+        a,b=st.columns(2)
+        lat=a.number_input("Latitude",min_value=-80.0,max_value=80.0,format="%.6f",key="study_lat")
+        lon=b.number_input("Longitude",min_value=-180.0,max_value=180.0,format="%.6f",key="study_lon")
+        radius=st.slider("Reference radius (km)",.5,50.0,3.0,.5)
+        start=st.date_input("Observation start",date.today()-timedelta(days=97),max_value=date.today())
+        end=st.date_input("Observation end",date.today()-timedelta(days=7),max_value=date.today())
+        st.caption("These dates control satellite/field observations and river history. Optional river/marine outlooks start today and have their own dates.")
+        upload=st.file_uploader("Optional water boundary — GeoJSON, WGS84",type=["geojson","json"])
+        if upload is not None:
+            try:
+                if upload.size>2_000_000:raise DataError("Use a boundary under 2 MB.")
+                st.session_state["boundary"]=mapping(normalize_geometry(json.loads(upload.getvalue())))
+            except Exception as exc:st.error("Boundary could not be used: "+str(exc)[:200])
+        custom=None
+        if st.session_state.get("boundary") and st.checkbox("Use uploaded / drawn boundary",key="use_boundary"):
+            custom=st.session_state["boundary"]
+        try:
+            study=make_study(label,lat,lon,radius,start,end,custom)
+            study["waterbody_type"]=kind
+        except DataError as exc:st.error(str(exc));study=None
+    with right:
+        if study:
+            response=show_map(base_map(study,True),"water-study-map",height=515,interactive=True)
+            drawing=(response or {}).get("last_active_drawing")
+            if drawing:st.button("Use this drawn boundary",on_click=apply_drawing,args=(drawing,))
+            if st.session_state.get("drawing_error"):st.error(st.session_state.pop("drawing_error"))
+            st.caption(f"{study['area_km2']:.2f} km² · {study['boundary']} · {study['lat']:.5f}, {study['lon']:.5f}")
+            st.info("Draw a local waterbody polygon or reach. The circle includes land unless you replace it. A boundary does not delineate an upstream catchment; forecasts use a nearby model cell, not a polygon average.")
+            if study["area_km2"]>MAX_SAT_KM2:st.warning(f"Satellite raster processing is limited to {MAX_SAT_KM2:g} km². Choose a smaller local area for imagery.")
+    st.subheader("Optional water data retrieval")
+    choices=available_modules(kind)
+    selected=st.multiselect("Fetch these sources now",choices,default=[],key="water_modules_"+kind)
+    st.caption("Leave this empty to work only with your own measurements. No AI API key is needed for any calculation or water-data download.")
+    with st.expander("Satellite and discharge settings"):
+        a,b,c=st.columns(3)
+        scenes=a.slider("Satellite scenes",1,6,3)
+        cloud=b.slider("Maximum whole-scene cloud cover (%)",5,90,40,5)
+        water=c.slider("Water-screen threshold",-.2,.4,0.0,.05)
+        flow=st.number_input("Optional river discharge screening threshold (m³/s)",min_value=0.0,value=0.0,disabled=kind!="River")
+        st.caption("A user-supplied discharge threshold is not an independently validated flood alert. Zero disables comparison.")
+    if st.button("Save water study and run selected analyses",type="primary",width="stretch",disabled=study is None):
+        options={"modules":selected,"scene_count":scenes,"cloud_limit":cloud,"water_threshold":water,"flow_threshold":flow}
+        with st.status("Preparing water study…",expanded=True) as status:
+            run=execute_analysis(study,options,lambda message:st.write(message))
+            # Clear previous study snapshots to bound session memory.
+            for k in list(st.session_state):
+                if k.startswith("research_") and isinstance(st.session_state[k],dict) and "records" in st.session_state[k]:del st.session_state[k]
+            st.session_state["run"]=run
+            st.session_state.pop("interpretation",None);st.session_state.pop("exports",None)
+            status.update(label="Water study saved" if not run["errors"] else "Study saved with unavailable sources",state="complete",expanded=False)
+        for name,error in run["errors"].items():st.warning(f"{name}: {error}")
+        st.success("Study saved for this session. Upload your field measurements in Water research or inspect the retrieved water maps.")
+        st.button("Open water research",on_click=go_page,args=("Water research",))
+
+
+def water_outlook_page(run):
+    banner("River & marine","Dated model output, kept separate from satellite observations and field measurements.")
+    if not need_run(run):return
+    kind=run["study"]["waterbody_type"]
+    if kind=="River":module_view(run,"River outlook")
+    elif kind=="Sea / coastal waters":module_view(run,"Marine outlook")
+    else:st.info("For lakes and reservoirs, use Satellite water maps and Water research. The app does not infer lake water balance, lake levels or outlet discharge from a nearby river model cell.")
+
+
+def ai_page(run):
+    from interpretation import evidence_packet, interpret_results, request_signature
+    banner("AI interpretation","One optional explanation of saved water results. No agents or autonomous analysis.")
+    if not need_run(run):return
+    if not run["results"]:
+        st.info("Retrieve water data or attach field measurements first. There are no computed results to interpret yet.");return
+    st.write("Review your data and calculations first. AI can explain patterns and limitations; it does not validate laboratory measurements or replace scientific review.")
+    providers=[p for p in PROVIDERS if p!="ollama" or secret("ENABLE_OLLAMA","false").lower()=="true"]
+    default=secret("AI_PROVIDER",DEFAULT_PROVIDER)
+    provider=st.selectbox("Interpretation provider",providers,index=providers.index(default) if default in providers else 0,format_func=lambda p:PROVIDERS[p]["label"])
+    meta=PROVIDERS[provider]
+    model=st.text_input("Model ID",value=secret(meta["model_name"],meta["model"]),key="interpret_model_"+provider)
+    st.caption(meta["note"])
+    st.markdown(f"[Provider key page]({meta['key_url']}) · [Current provider limits]({meta['limits_url']})")
+    configured=secret(meta["key_name"],"")
+    if configured and "PASTE_" not in configured and configured != "YOUR_ACTUAL_KEY":
+        st.caption("A provider key is configured in Streamlit Secrets.")
+        key=configured
+    else:
+        key=st.text_input("Optional API key for this session",type="password",key="private_key_"+provider)
+        st.caption("Keys are not included in reports, downloads or the interpretation evidence packet.")
+    question=st.text_area("What should the interpretation focus on?",value="Explain the observed water-quality patterns, field/satellite agreement where available, uncertainty and priorities for further sampling.",max_chars=1500)
+    try:packet=evidence_packet(run)
+    except DataError as exc:st.error(str(exc));return
+    with st.expander("Inspect the exact evidence summary sent to the provider"):
+        st.json(json.loads(json.dumps(packet,default=str)),expanded=False)
+    consent=st.checkbox("Send this displayed evidence summary and my question to the selected provider",value=False)
+    st.caption("The packet includes your study name, source records, calculated summaries and bounded table excerpts. Your raw workbook and raster files are not sent. Provider terms and quotas apply.")
+    if st.button("Interpret saved results",type="primary",disabled=not consent or (not key and provider!="ollama")):
+        previous=st.session_state.get("interpretation")
+        signature=request_signature(run,provider,model,question)
+        if interpretation_is_current(run,previous) and previous.get("request_signature")==signature:
+            st.info("Showing the saved interpretation for the same evidence and question; no API call was made.")
+        else:
+            try:
+                with st.spinner("Requesting a single interpretation…"):
+                    interpretation=interpret_results(run,provider,model,key,question,base_url=secret("OLLAMA_BASE_URL","") or None)
+                st.session_state["interpretation"]=interpretation
+                st.session_state.pop("exports",None)
+                research_state(run).pop("download",None)
+            except (DataError,ValueError) as exc:st.error(str(exc))
+    saved=st.session_state.get("interpretation")
+    if interpretation_is_current(run,saved):
+        st.divider();st.markdown(saved["answer"])
+        st.caption(f"{saved['provider']} · {saved['model']} · {saved['generated_utc']} · one request. Source-ID presence was checked; factual correctness still needs review.")
+        st.download_button("Download AI interpretation",saved["answer"],"hydroscope_interpretation.md","text/markdown")
+        if st.button("Remove saved interpretation"):
+            st.session_state.pop("interpretation",None);st.session_state.pop("exports",None)
+            research_state(run).pop("download",None);st.rerun()
+
+
+def reports_page(run):
+    st.title("Reports & sources")
+    if not need_run(run):return
+    st.write("Generate a report from the saved evidence. The complete package also includes recorded research calculations, statistical figures, original uploads and offline replay code when research analyses exist.")
+    cols=st.columns(3)
+    cols[0].metric("Evidence modules",len(run["results"]))
+    cols[1].metric("Data tables",len(all_tables(run)))
+    cols[2].metric("Source records",len(all_sources(run)))
+    saved=st.session_state.get("interpretation");include=False
+    if interpretation_is_current(run,saved):include=st.checkbox("Include the optional AI interpretation",True)
+    else:st.caption("AI interpretation is optional. All scientific data and exports work without it.")
+    lab=research_state(run)
+    export_key=(run_fingerprint(run),saved.get("generated_utc") if include else None,
+                hashlib.sha256(research_json(lab["points"]).encode()).hexdigest())
+    if st.button("Build complete water report package",type="primary"):
+        try:
+            with st.spinner("Rendering water figures, tables, reports and methods…"):
+                with report_lock():
+                    research_figures=[]
+                    for record in lab["records"]:
+                        for spec in record["output"].get("plots",[]):
+                            from environment import figure_png
+                            research_figures.append((record["id"]+" — "+spec["title"],figure_png(research_plot(spec,record["output"]["tables"]))))
+                    exports=build_exports({**run,"interpretation":saved} if include else run,research_figures)
+                    if lab["records"]:
+                        replay_zip=research_package(run,lab,include_interpretation=include)
+                        full=io.BytesIO()
+                        with zipfile.ZipFile(io.BytesIO(exports["zip"])) as original,zipfile.ZipFile(full,"w",zipfile.ZIP_DEFLATED) as z:
+                            for n in original.namelist():z.writestr(n,original.read(n))
+                            z.writestr("research_reproducibility.zip",replay_zip)
+                        exports["zip"]=full.getvalue()
+            st.session_state["exports"]={"key":export_key,"files":exports}
+        except Exception as exc:
+            st.error(f"Report generation stopped ({type(exc).__name__}): {str(exc)[:220]}. Your saved results remain available.")
+    bundle=st.session_state.get("exports")
+    if bundle and bundle.get("key")==export_key:
+        ex=bundle["files"]
+        for col,label,ext,mime in zip(st.columns(4),["Complete ZIP","PDF report","HTML report","Excel data"],["zip","pdf","html","xlsx"],
+                                      ["application/zip","application/pdf","text/html","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]):
+            col.download_button(label,ex[ext],f"hydroscope_{run['id']}.{ext}",mime,width="stretch")
+        st.success("Download your files before closing the session. No persistent project database is configured.")
+    st.subheader("Evidence and quality checks")
+    st.dataframe(pd.DataFrame(quality_findings(run)),hide_index=True,width="stretch")
+    st.dataframe(pd.DataFrame(all_sources(run)),hide_index=True,width="stretch")
+    st.download_button("Run metadata",json.dumps(plain_metadata(run),indent=2,default=str),"metadata.json","application/json")
+    with st.expander("Coverage, scientific methods and data access"):
+        st.write("Satellite: Sentinel-2 optical screening; Landsat surface temperature in Water research → Satellite matchups. Sentinel-1 is catalogue discovery only. No automatic water-quality concentration or toxic-bloom classifier is supplied.")
+        st.write("Water statistics: Pearson/Spearman, held-out linear/additive regression, PCA, Hellinger RDA, clustering and observed-month seasonal decomposition. Review assumptions and sample independence; no automated causal inference.")
+        st.write("WASP, AQUATOX, CE-QUAL-W2 and EcoDynamo workflows are documented data exchange and imported outputs. They are not installed or executed by this app.")
+        st.markdown("Data attribution: [Copernicus Sentinel](https://sentinels.copernicus.eu/) · [USGS Landsat](https://www.usgs.gov/landsat-missions) · [Open-Meteo terms and access](https://open-meteo.com/en/terms) · [OpenStreetMap](https://www.openstreetmap.org/copyright). Hosted free services have usage limits; commercial deployment may require provider agreements.")
+
+
+def main():
+    st.set_page_config(page_title="HydroScope | Water Research",layout="wide",initial_sidebar_state="expanded")
+    inject_theme()
+    for key,value in {"study_label":"Rawal Lake, Islamabad","study_lat":33.700,"study_lon":73.120,"page":"Overview","use_boundary":False}.items():
+        if key not in st.session_state:st.session_state[key]=value
+    run=st.session_state.get("run")
+    if run and run.get("version")!=VERSION:
+        st.session_state.pop("run",None);run=None
+        st.info("Save a new water study for this version. Previous downloaded reports are unaffected.")
+    with st.sidebar:
+        st.html("<div class='eco-brand'><div><strong>Hydro<span style='color:#72E2C9'>Scope</span></strong><small>Water research</small></div></div>")
+        if st.session_state.get("page") not in PAGES:st.session_state["page"]="Overview"
+        page=st.radio("Workspace",PAGES,key="page",label_visibility="collapsed")
+        st.divider()
+        if run:
+            st.markdown("**"+run["study"]["label"]+"**")
+            st.caption(run["study"]["waterbody_type"])
+            st.caption(f"{run['study']['start']} → {run['study']['end']}")
+            st.caption(f"{len(run['results'])} evidence modules · {len(run['errors'])} unavailable")
+        else:st.write("Start with a waterbody and a research question.")
+        st.divider();st.caption("1.0.0 · Water only · No agents")
+        st.caption("Calculations and reports work without AI.")
+    a,b=st.columns([4,1])
+    a.caption("HYDROSCOPE WATER RESEARCH · "+page)
+    b.button("Study setup",on_click=go_page,args=("Water study",),width="stretch")
+    if page=="Overview":overview(run)
+    elif page=="Water study":study_page()
+    elif page=="Satellite water maps":satellite_page(run)
+    elif page=="Water research":research_page(run)
+    elif page=="River & marine":water_outlook_page(run)
+    elif page=="AI interpretation":ai_page(run)
+    else:reports_page(run)
+
+
+if __name__=="__main__":
     main()

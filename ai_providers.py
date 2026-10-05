@@ -32,12 +32,12 @@ PROVIDERS = {
     },
     "ollama": {
         "label": "Ollama on your own computer/server", "key_name": "OLLAMA_API_KEY",
-        "model": "aquaterra-local", "model_name": "OLLAMA_MODEL",
+        "model": "qwen2.5:7b", "model_name": "OLLAMA_MODEL",
         "base_url": "http://127.0.0.1:11434/v1",
         "key_url": "https://ollama.com/download",
         "limits_url": "https://docs.ollama.com/faq",
         "rpm": 30, "tpm": 100000,
-        "note": "Local inference has no hosted API quota. Your hardware, electricity, model licence and app run budgets still limit capacity. Community Cloud cannot reach localhost on your laptop.",
+        "note": "Local inference has no hosted API quota. Your hardware, electricity, model licence and available memory still limit capacity. Community Cloud cannot reach localhost on your laptop.",
     },
 }
 

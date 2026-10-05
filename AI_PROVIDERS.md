@@ -1,61 +1,35 @@
-# AI services and limits
+# Optional AI interpretation — no agents
 
-Checked against official documentation on **3 October 2026**. Provider models,
-prices, eligibility and quotas can change. No unlimited free hosted LLM API is
-promised by this application.
+HydroScope performs every data retrieval and scientific calculation without an LLM. The only AI feature is an explicit, single chat-completion request that explains already-computed evidence. CrewAI and all agent files/dependencies have been removed.
 
-| Option | Cost/limits | Use in this app |
-| --- | --- | --- |
-| Google Gemini | Selected models have a free tier; project/model RPM, TPM and daily quotas apply. | Default hosted option; initial model `gemini-3.5-flash-lite`. |
-| OpenRouter free models | Free models/free router still have daily and per-minute caps and variable capacity. | Supported; only `openrouter/free` or `:free` model IDs are accepted. |
-| Groq | Free access is rate-limited. | Retained as an optional provider. |
-| Ollama local | No hosted-provider token quota for models running locally; your hardware, electricity and model licence still matter. | Owner-enabled local/self-hosted option. |
-| Cerebras | Official docs currently describe a $5 trial, expiring after 30 days, requiring a verified payment method. No permanently renewing free tier. | Not included as a free provider. |
+Supported choices are Gemini, Groq, OpenRouter free models and owner-enabled Ollama. Select one in **AI interpretation**. Configure its API key/model in Streamlit Secrets (see `secrets.example.toml`) or enter a key privately for the current session. Hosted endpoints are fixed; users cannot redirect server keys to arbitrary URLs. An Ollama URL can be configured only by the app owner.
 
-For Streamlit Community Cloud, begin with Gemini and use OpenRouter as another
-explicitly selected option. Do not assume either can keep five agents running
-without limits. One review requires at least five generation calls and may use
-up to 18, including tool rounds and corrections. The connection test uses one
-additional call. Completed identical reviews are reused unless you request a
-fresh one. Public environmental data analysis needs no LLM key.
+| Provider | Secret | Model setting | Access |
+|---|---|---|---|
+| Gemini | GEMINI_API_KEY | GEMINI_MODEL | Account/model quotas and data terms apply |
+| Groq | GROQ_API_KEY | GROQ_MODEL | Account/model quotas apply |
+| OpenRouter | OPENROUTER_API_KEY | OPENROUTER_MODEL | Only `openrouter/free` or `:free` IDs accepted; quotas and upstream terms apply |
+| Ollama | optional OLLAMA_API_KEY | OLLAMA_MODEL | Local hardware or an owner-configured authenticated server |
 
-Provider switching is manual. The application does not rotate keys, bypass
-quotas, retry indefinitely or switch silently to a paid service. On quota errors
-it stops and retains completed agent notes. Per-minute settings only slow the
-application; they cannot increase an account's limits. Gemini quotas are per
-project, so another key from the same project does not create a new allowance.
+The supplied model IDs are defaults, not guarantees of continued availability. Change a model ID if the provider retires it or your account lacks access. Do not assume there is an unlimited free hosted API. Ollama has no hosted-provider quota when you run an open model locally, but compute, memory, electricity and model licensing still apply. A Streamlit Community Cloud process cannot reach `localhost` on your laptop.
 
-The default budgets are 18 model requests, 10 minutes and 22,000 input characters
-per individual model request. Output limits are 3,072 tokens for Gemini,
-OpenRouter and Ollama, and 1,800 for Groq. These bounded runs prevent agent loops;
-they are distinct from provider quotas. Input/token estimates are approximate.
-Pacing is shared within this Python server process, not across other apps or
-server replicas using the same credentials.
+For local Ollama, install it from [ollama.com](https://ollama.com/download), pull `qwen2.5:7b` (or an appropriate available model), and run this Streamlit app on the same computer. Set `ENABLE_OLLAMA = true`, `OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"` and the model ID in local secrets. An internet-accessible deployment needs a secured HTTPS proxy; never expose an unauthenticated Ollama service publicly.
 
-## Privacy and reproducibility
+## What is sent and retained
 
-The chosen service receives the question, coordinates, saved evidence summaries
-and tool-returned statistics/table previews. It does not receive full upload
-files or raw satellite rasters. Google documents product-improvement use for
-unpaid-service data. OpenRouter also involves the selected underlying provider;
-check its data policies before sending confidential or unpublished research.
+The displayed packet contains the study name/type, date range, evidence sources, calculated summaries, method/uncertainty notes and bounded table excerpts. It excludes raw files and raster arrays; direct sample identifiers and coordinate columns are filtered from table excerpts. Inspect it before consenting because your study name or uploaded parameter names may still be sensitive.
 
-Keys are kept per LLM instance, never exported in reports, and hosted endpoints
-are fixed. Local model inference can keep the AI prompt on your own machine.
-AI wording is not guaranteed reproducible. Numerical replay is separate and
-uses frozen processed snapshots, explicit settings and saved scientific code.
-The requested and returned model IDs are recorded, including when the free
-OpenRouter router changes the selected model.
+The provider receives the system prompt, your question and that packet. It receives no code-execution tools, retrieval tools or autonomous task loop. The app records the response, model IDs, prompt, evidence packet, usage, timestamp and evidence fingerprint, but no API credential.
 
-## Official references
+A successful answer must cite existing source IDs. This checks that an ID exists, **not that every sentence or numerical claim is correct**. Review the text before sharing it. No result becomes scientifically validated merely because AI describes it.
 
-- Gemini pricing: https://ai.google.dev/gemini-api/docs/pricing
-- Gemini active quotas: https://ai.google.dev/gemini-api/docs/rate-limits
-- Gemini compatibility: https://ai.google.dev/gemini-api/docs/openai
-- Gemini lifecycle: https://ai.google.dev/gemini-api/docs/deprecations
-- OpenRouter limits: https://openrouter.ai/docs/api/reference/limits
-- OpenRouter free router: https://openrouter.ai/docs/guides/routing/routers/free-router
-- Cerebras trial: https://inference-docs.cerebras.ai/support/rate-limits
-- Ollama API: https://docs.ollama.com/api/openai-compatibility
-- Ollama FAQ: https://docs.ollama.com/faq
-- Groq limits: https://console.groq.com/docs/rate-limits
+The identical saved evidence/provider/model/question reuses the saved answer. A new request is limited to one HTTP call, with a 20-second minimum between requests per running server process. Provider HTTP 429 errors stop immediately; there are no hidden retries or automatic paid fallbacks. A changed evidence fingerprint invalidates the saved interpretation. Removing the interpretation also invalidates cached report packages. Scientific data and exports remain usable during provider outages or without a key.
+
+Provider references:
+
+- https://ai.google.dev/gemini-api/docs/openai
+- https://ai.google.dev/gemini-api/docs/rate-limits
+- https://ai.google.dev/gemini-api/docs/pricing
+- https://console.groq.com/docs/openai
+- https://openrouter.ai/docs/api/reference/limits
+- https://docs.ollama.com/api/openai-compatibility

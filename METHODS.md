@@ -1,200 +1,69 @@
-# AquaTerra Research AI — methods, provenance and limits
+# Water data, methods and boundaries of inference
 
-Version 2.0.0. This is a research MVP, not a validated government warning service.
-Every run separates observations, satellite-derived screening, reanalysis and
-forecasts. There is no substitution of fabricated/demo measurements after a failure.
+HydroScope 1.0.0 (2026-10-05) separates **field measurements**, **satellite screening indices**, **calculated statistics** and **model estimates**. A single optional AI explanation is downstream of these results. Source IDs, retrieval timestamps, periods, grids and processing settings are retained. Missing retrievals are shown as unavailable, with no simulated substitute.
 
-## Spatial support
+## Geography and waterbody type
 
-The user selects a geodesic radius, draws a polygon or uploads WGS84 GeoJSON.
-Areas use the WGS84 ellipsoid. MultiPolygons and holes are supported. The app rejects
-invalid geometries and broad/antimeridian or polar study areas. It does not derive
-catchments. Weather, air quality and discharge are sampled at the polygon centroid;
-they are not averages over the polygon. Source grid coordinates are retained.
+A geocoded name gives a reference point. Users must verify coordinates and select/draw a local WGS84 polygon. Areas use ellipsoidal geodesic calculations. Selected boundaries are not whole river basins or automatically delineated water surfaces. Forecast requests use the study centroid's nearby provider cell; returned coordinates appear in source records. Samples with invalid coordinates cannot enter spatial matching; samples without coordinates can still be used in explicitly nonspatial statistics.
 
-## Climate and weather
+Waterbody type controls the available adapters. River discharge is offered only for River studies. Marine output is offered only for Sea / coastal waters. Lake/reservoir studies use field and satellite analysis; the app does not fabricate lake outflow, bathymetry, storage or water balance.
 
-- Historical source: ERA5 via Open-Meteo's archive API; forced `models=era5` for a
-  consistent product. Temperature, precipitation and reference evapotranspiration are
-  returned as daily summaries. These are reanalysis estimates, not local station data.
-- A seven-day lag buffer avoids requesting the newest incomplete ERA5 records.
-- Precipitation includes rain and the water equivalent of snow. Totals sum only
-  returned values. The available-day count is reported;
-  missing days do not become zeros. A completely missing month stays missing.
-- Optional baseline: 1991–2020 monthly normals from the same model/grid. Anomalies
-  are computed only for complete study months with at least 25 complete baseline
-  years for that calendar month. Partial-month totals remain labelled in the table.
-- Weather forecast: seven days from the date of retrieval, using provider-selected
-  weather models. Temperature extremes, precipitation, precipitation probability and
-  maximum wind speed are retained. No local ML forecast is claimed.
-- No long-term climate-change inference is made from a short study window. No
-  future climate scenario projection is included in this version.
+## Sentinel-2 optical water screening
 
-Sources: https://open-meteo.com/en/docs/historical-weather-api and
-https://open-meteo.com/en/docs
+Earth Search collection `sentinel-2-c1-l2a`; STAC catalogue IDs/times and asset radiometry are retained. Bounded cloud-filtered scene candidates are searched, and a limited number are processed. This is not a complete annual/monthly census. Common projected grids use bilinear reflectance and nearest-neighbour scene classification. Raster scaling/offset are taken from metadata; fill and nonphysical reflectance are masked.
 
-## Air quality
+Supported clear classes are SCL 4/5/6. Water additionally requires SCL 6, NDVI below 0.3 and either NDWI or MNDWI above the selected threshold. NDVI is an internal vegetation-exclusion screen, not a terrestrial-analysis page or exported vegetation product. The conservative water mask can reject turbid, shallow, shoreline or bloom-covered pixels; no detection does not prove no water or no bloom.
 
-Five days of hourly PM2.5, PM10, NO2, O3 and the provider's US AQI are retrieved from
-Open-Meteo/CAMS. This is a current model/forecast window, separate from the historical
-study period. CAMS grid resolution depends on location/model. It is not a local
-sensor reading or a fine-resolution pollution map. The AQI convention is labelled.
+- NDWI = (green − NIR) / (green + NIR).
+- MNDWI = (green − SWIR) / (green + SWIR).
+- NDCI = (red edge − red) / (red edge + red), on screened water only.
+- Water red reflectance is retained as a scattering/turbidity-related screening variable, not a concentration in NTU.
 
-Source: https://open-meteo.com/en/docs/air-quality-api
+No global chlorophyll calibration, turbidity equation, cyanobacterial classifier or toxin model is assumed. Atmospheric correction, clouds, bottom reflectance/depth, suspended sediment, adjacency, reservoir optical properties and sensor support affect estimates. Relative high-index sampling candidates are suggestions for validation, not confirmed blooms. The first/last water-area comparison uses a shared valid footprint; per-scene water areas have different clear footprints and should not be compared as if coverage were constant.
 
-## Satellite processing
+## Landsat temperature and Sentinel-1
 
-1. Search Earth Search's Sentinel-2 Collection 1 L2A catalogue
-   (`sentinel-2-c1-l2a`) by time and bounding box. There is no automatic fallback
-   to the legacy collection, which has reported reflectance-offset inconsistencies.
-   Missing Collection 1 coverage stays unavailable.
-2. Retrieve at most 200 catalogue items and apply the whole-scene cloud filter.
-   Deduplicate dates, preferring the tile with the greatest study-area overlap.
-3. Select up to six dates distributed across the retrieved candidate list; a
-   one-scene run uses the newest candidate. This is a selected-scene analysis,
-   not a complete monthly record or a tile mosaic.
-4. Read COG windows using GDAL/Rasterio with TLS verification and bounded retries.
-5. Apply each band's STAC `raster:bands` scale and offset once. Do not assume raw
-   digital numbers are already comparable reflectance. Missing scale metadata
-   prevents processing rather than triggering guessed calibration.
-6. Reproject to a common local UTM grid, at least 20 m, increasing cell size when
-   required by the 600,000-pixel working limit. Reflectance is bilinearly resampled;
-   scene classification uses nearest-neighbour resampling. Derived pixels do not
-   have higher physical resolution than the source bands.
-7. Accept only scene-classification (SCL) classes 4, 5 and 6 inside the AOI. Remove
-   missing/negative reflectance and undefined normalised differences. This is a
-   conservative screen, not a perfect atmospheric/glint correction.
+Research matchups include Landsat Collection 2 L2 surface-temperature assets and QA via Planetary Computer. Water/clear/saturation/uncertainty checks are applied; the common analysis grid is at least 120 m. Satellite skin temperature and in-water temperature at depth differ. Read RESEARCH_METHODS.md for matching tolerances and limits. Sentinel-1 integration is scene discovery only, not a radar-to-chlorophyll retrieval or flood-depth solver.
 
-| Output | Equation / interpretation |
-|---|---|
-| NDVI | `(B8 - B4) / (B8 + B4)`; vegetation-related reflectance contrast |
-| NDWI | `(B3 - B8) / (B3 + B8)`; water-related reflectance contrast |
-| MNDWI | `(B3 - B11) / (B3 + B11)`; water-related contrast using SWIR |
-| Screened water | Clear SCL class 6, NDVI < 0.3, and NDWI or MNDWI above the user threshold (default 0) |
-| NDCI | `(B5 - B4) / (B5 + B4)`, within screened water only |
-| Water red reflectance | B4 surface reflectance within screened water; uncalibrated optical proxy |
+## Measured water quality and trophic indicators
 
-The scene-level water area is the count of screened-water pixels times projected
-pixel area. Coverage is reported alongside it. First/last date change uses only
-pixels valid on both dates, avoiding a false area-change claim caused solely by
-different cloud masks. Small common footprints do not receive a change conclusion.
+Upload XLSX/CSV, map columns and confirm units. No silent unit conversion, outlier deletion, imputation or calibration is performed. Salinity uses the common PSU notation for practical salinity; conductivity uses µS/cm and its temperature/reference convention must be documented by the researcher. Compare like laboratory methods and depths.
 
-Sampling candidates are the highest within-scene NDCI ranks, separated by at least
-200 m, capped at ten points. They are candidates for field inspection, not confirmed
-pollution or toxic-bloom locations. Relative high rank can occur even when every
-index value is low; no universal hazard threshold is inferred.
+Site/month summaries use actual included samples, with count, mean, median, standard deviation and extrema where defined. Missing months stay missing. Unequal site sampling does not become an area average. Field bubble maps are sampled points with capped display sizes, not interpolated water-quality maps.
 
-### Water science limits
+Only explicitly confirmed freshwater Lake/Reservoir studies enable separate measured Carlson trophic indicators:
 
-Sentinel-2 L2A is a land surface-reflectance product. Inland-water atmospherics,
-glint, adjacency effects, sediment, shallow bottoms and aquatic vegetation may
-confound these indices. Broad scene classifications can miss or misclassify water.
-Narrow rivers may not resolve. There is no calibrated conversion to chlorophyll-a,
-turbidity in NTU, TSS, nutrients, pathogens, dissolved oxygen or drinking-water safety.
-No eutrophication diagnosis or toxic-bloom confirmation is made from NDCI alone.
-Use coincident field samples and a validated regional algorithm for concentrations.
+- Chlorophyll: 9.81 × ln(chlorophyll-a µg/L) + 30.6.
+- Secchi: 60 − 14.41 × ln(Secchi depth m).
+- Total phosphorus: 14.42 × ln(total phosphorus µg/L) + 4.15.
 
-Sources:
-- https://github.com/Element84/earth-search
-- https://documentation.dataspace.copernicus.eu/APIs/STAC.html
-- https://www.earthdata.nasa.gov/learn/trainings/monitoring-water-quality-inland-lakes-using-remote-sensing
+Positive inputs are required. The app never averages these indices. Applicability is user-confirmed; river, coastal/marine, saline or sediment-dominated conditions may make these relationships unsuitable. Neither these indices nor phytoplankton abundance establish toxicity or safe water use.
 
-## Field observations and trophic indices
+## River and marine models
 
-CSV values retain their explicit column units. Date/coordinate validity, numeric
-values, negative concentrations and pH bounds are checked. Out-of-period and
-out-of-polygon observations remain in an audit table, excluded from summaries.
-The app does not verify instrument calibration, laboratory procedures or identity.
+River requests use the Open-Meteo Flood API with explicit GloFAS v4 seamless selection. Historical daily model values and the present seven-day forecast are separate tables. The seamless archive combines reanalysis/archived forecasts and is not a homogeneous gauge record. Approximate 5 km grid support can select the wrong river. Model version is requested; underlying issue time is not fully echoed. Ensemble quartiles show spread, not calibrated confidence. A user threshold is an unvalidated screen, not flood depth/inundation or an official warning.
 
-When the user selects lake/reservoir index calculations, each positive input has
-its own Carlson index:
+Marine requests use the Open-Meteo Marine API, sea-cell selection, UTC and seven days from the current day. Variables are sea-surface temperature, significant wave height/period, current speed/direction and sea level relative to global mean sea level. Native grid/time support varies; hourly API output can be interpolated from coarser model steps. Source/returned-unit tables and missing-variable notes are retained. Coastal/estuarine and inland support may be poor. These are model forecasts, not remote-sensing measurements, ocean chemistry or safe-navigation instructions. Wave height is significant wave height, not the maximum individual wave. No offshore ocean-colour concentration product is integrated.
 
-- TSI(chlorophyll) = `9.81 * ln(chlorophyll_ug_l) + 30.6`
-- TSI(Secchi) = `60 - 14.41 * ln(secchi_m)`
-- TSI(total phosphorus) = `14.42 * ln(total_phosphorus_ug_l) + 4.15`
+## Statistics and research reproducibility
 
-The indices are not averaged. Zero or missing values yield no logarithmic index.
-Index applicability depends on lake conditions; non-algal turbidity and other
-confounders require interpretation. These equations are not applied to satellite
-NDCI values or automatically extended to rivers.
+RESEARCH_METHODS.md documents the numerical methods and assumptions. Independent samples are required before enabling unrestricted permutation/bootstrap inference. Grouped held-out validation is separate from calibration. Time series may be autocorrelated; multiple observations of the same satellite pixel must not leak across training and validation. Figures alone do not establish publication validity.
 
-Source: https://www.nalms.org/secchidipin/monitoring-methods/trophic-state-equations/
+The detailed research package preserves input snapshots, source/scene metadata, processed windows, masks, settings, code, seeds and SHA256 file hashes. `reproduce.py` checks hashes and reruns numerical analyses and saved-window satellite matching without network or AI. This is not a full Level-1 atmospheric-processing replay. Imported external model outputs remain imported estimates, not rerun simulations. Download files before the Streamlit session ends.
 
-## River outlook
+## Sources and attribution
 
-Open-Meteo's GloFAS endpoint provides a seven-day discharge outlook and ensemble
-quartiles. The app uses the provider default model because unsupported model-name
-parameters were rejected during live checks. The returned response does not echo
-an exact model version/issuance time; that uncertainty is retained in provenance.
+- [Copernicus Sentinel-2](https://sentiwiki.copernicus.eu/web/s2-products) / [Earth Search](https://github.com/Element84/earth-search).
+- Mishra & Mishra (2012), NDCI: https://doi.org/10.1016/j.rse.2011.10.016. Implementing an index does not establish local calibration transferability.
+- [USGS Landsat surface temperature](https://www.usgs.gov/landsat-missions/landsat-collection-2-surface-temperature) and [QA bands](https://www.usgs.gov/landsat-missions/landsat-collection-2-quality-assessment-bands).
+- [NALMS Carlson trophic equations](https://www.nalms.org/secchidipin/monitoring-methods/trophic-state-equations/).
+- [Open-Meteo river model documentation](https://open-meteo.com/en/docs/flood-api), attribution to Open-Meteo/Copernicus Emergency Management Service/GloFAS.
+- [Open-Meteo marine documentation](https://open-meteo.com/en/docs/marine-weather-api), attribution to Open-Meteo and upstream providers including DWD, Météo-France and Copernicus Marine as applicable.
+- [Open-Meteo terms](https://open-meteo.com/en/terms) and [access limits](https://open-meteo.com/en/pricing). Free hosted API use is subject to noncommercial restrictions/quotas; source licences and attribution still apply.
+- [OpenStreetMap attribution](https://www.openstreetmap.org/copyright) and [Nominatim policy](https://operations.osmfoundation.org/policies/nominatim/). Searches are explicit, cached and throttled within this app process. Multiple replicas need coordinated compliance.
+- [RDA methodology reference](https://vegandevs.github.io/vegan/reference/cca.html) and [classical seasonal decomposition](https://www.statsmodels.org/stable/generated/statsmodels.tsa.seasonal.seasonal_decompose.html).
 
-The model's approximately 5 km grid may represent a different river from the named
-location. Quartiles describe ensemble spread, not a locally calibrated probability.
-An optional positive user flow threshold enables an exceedance count, labelled as
-user-defined and unvalidated. No flood depth, inundation polygon or flash-flood
-probability is inferred. Local gauges, basin modelling and validation are required.
+Parameter-contract references used for this release:
 
-Source: https://open-meteo.com/en/docs/flood-api
-
-## Earthquakes and severe-weather alerts
-
-USGS events are retrieved within a separately stated radius (default 150 km),
-historical period and magnitude filter. The newest 1,000 events are the maximum
-retrieval. Magnitude type, depth, review status and event links are preserved.
-Catalogue counts are not hazard probabilities and completeness varies.
-
-Reliable prediction of future earthquake time/location/magnitude is not available.
-The US NWS adapter retrieves active official alerts only where the US service
-operates. An empty list is not proof of safety or coverage outside that area.
-There is no worldwide tornado prediction model in this application.
-
-Sources:
-- https://earthquake.usgs.gov/fdsnws/event/1/
-- https://www.usgs.gov/faqs/can-you-predict-earthquakes
-- https://www.weather.gov/documentation/services-web-api
-- https://www.nssl.noaa.gov/education/svrwx101/tornadoes/forecasting/
-
-## Biodiversity
-
-GBIF search filters by bounding box, selected event dates, coordinates and the
-provider's geospatial-issue flag. Up to 300 candidate records are retrieved and
-then filtered to the exact polygon. The bounding-box total and returned subset
-size are distinguished. Names, dataset IDs, licences and uncertainty are retained.
-Counts of recorded taxa/observations reflect sampling effort and bias, not true
-species richness, animal abundance or ecological absence.
-
-Sources: https://techdocs.gbif.org/en/openapi/v1/occurrence and
-https://docs.gbif.org/course-introduction-to-gbif/en/handling-data-quality.html
-
-## AI, exports and reproducibility
-
-The optional CrewAI workflow contains exactly five agents in a sequential process:
-study coordinator, climate/air analyst, geospatial/water analyst, ecology/field
-analyst, and evidence reviewer/report writer. They review the saved run and can
-read scoped provenance/facts or compute supported statistics from its tables.
-They do not see raster image pixels or execute arbitrary code. Tool rounds,
-provider requests and execution time are bounded; errors preserve analysis results.
-
-Computed checks flag local study scope, partial months, unusable water screening
-and missing evidence. Citation guardrails reject unknown source IDs but cannot
-guarantee every AI interpretation is correct. A fingerprint binds completed AI
-output to the actual evidence. A changed analysis invalidates the previous review.
-
-AI output is labelled, downloadable separately and optionally included in PDF,
-HTML and the results ZIP. Standard reports remain available without AI. They use
-retrieved/calculated values and include coverage warnings and failed modules.
-No numerical confidence is inferred from LLM agreement. Review all interpretations
-against the sources before policy or operational use.
-
-Source retrieval timestamps are retained in caches, not replaced by the report
-generation timestamp. Provider model issuance time is stated as unavailable where
-the API does not provide it. Time-series forecasts are not mixed with historical
-reanalysis. Satellite acquisition timestamps remain separate from retrieval time.
-
-The export bundle contains all returned tables, figures, source records, the AOI,
-run settings, and latest processed satellite indices. Raw full-scene satellite
-files are not embedded. A later provider revision may change re-downloaded source
-data; retain exports and scene IDs for reproducibility. No persistent server-side
-project database or autonomous scheduling is included in this MVP.
-
-CSV and Excel text exports neutralise leading spreadsheet formula characters.
-Secrets are not included in exports. User/provider strings are escaped in HTML/PDF.
+- https://github.com/open-meteo/open-meteo/blob/main/openapi/flood.yml (`models=seamless_v4`).
+- https://github.com/open-meteo/open-meteo/blob/main/openapi/marine.yml (`wind_speed_unit=kmh`, `temperature_unit=celsius`, `length_unit=metric`).

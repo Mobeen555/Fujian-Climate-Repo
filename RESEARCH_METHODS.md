@@ -2,8 +2,8 @@
 
 This extends METHODS.md for the water/field research tools. In the app, each
 record shows its input data, settings, calculation, statistical results and
-limitations. The five AI agents can review recorded evidence; they do not invent
-measurements, execute arbitrary code or provide independent scientific validation.
+limitations. The optional single-model interpreter explains a bounded summary of recorded results.
+It has no tools, cannot execute code or retrieve data, and does not provide independent scientific validation.
 
 ## Field records and spatial matching
 
