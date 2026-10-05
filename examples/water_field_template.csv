@@ -1,0 +1,1 @@
+sample_id,site,date,latitude,longitude,depth_m,chlorophyll_ug_l,turbidity_ntu,secchi_m,temperature_c,total_phosphorus_ug_l,total_nitrogen_mg_l,dissolved_oxygen_mg_l,ph,phycocyanin_ug_l,cyanobacteria_cells_ml,salinity_psu,conductivity_us_cm,laboratory_method,quality_note

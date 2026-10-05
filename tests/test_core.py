@@ -41,47 +41,14 @@ def test_indices_do_not_turn_missing_or_negative_reflectance_into_results():
     assert np.isnan(out[1:]).all()
 
 
-def test_missing_month_not_zero_and_partial_month_not_complete():
-    frame = pd.DataFrame({"date":pd.date_range("2025-01-01",periods=31),
-                          "precipitation_sum":[np.nan]*31,"temperature_2m_mean":[20.]*31})
-    month = app.monthly_climate(frame).iloc[0]
-    assert np.isnan(month.precipitation_mm)
-    assert not month.complete_month
-    frame.loc[0,"precipitation_sum"] = 10
-    month = app.monthly_climate(frame).iloc[0]
-    assert month.precipitation_mm == 10 and month.precipitation_days_available == 1
-    assert not month.complete_month
 
 
-def test_complete_leap_month():
-    frame = pd.DataFrame({"date":pd.date_range("2024-02-01",periods=29),
-                          "precipitation_sum":[1.]*29,"temperature_2m_mean":[20.]*29})
-    month = app.monthly_climate(frame).iloc[0]
-    assert month.complete_month and month.precipitation_mm == 29
 
 
-def test_field_filter_units_and_separate_trophic_indices(study):
-    csv = b"site,date,latitude,longitude,chlorophyll_ug_l,secchi_m,total_phosphorus_ug_l\nQA,2025-01-10,33.7,73.12,10,2,30\nOUTSIDE,2025-01-10,35,75,20,1,40\nOLD,2020-01-10,33.7,73.12,0,0,0\n"
-    r = app.parse_field_csv(csv,study,True)
-    all_rows = r["tables"]["Field observations audit"]
-    included = r["tables"]["Included field observations"]
-    assert len(all_rows) == 3 and len(included) == 1
-    assert included.iloc[0].tsi_chlorophyll == pytest.approx(53.18835976,rel=1e-6)
-    assert included.iloc[0].tsi_secchi == pytest.approx(50.01174913,rel=1e-6)
-    assert np.isnan(all_rows.iloc[2].tsi_chlorophyll)
-    assert "tsi_average" not in all_rows
 
 
-@pytest.mark.parametrize("tail",["not-a-number", "-2", "inf"])
-def test_bad_measurements_rejected(study,tail):
-    csv = f"site,date,latitude,longitude,chlorophyll_ug_l\nQA,2025-01-10,33.7,73.12,{tail}\n".encode()
-    with pytest.raises(app.DataError):
-        app.parse_field_csv(csv,study)
 
 
-def test_river_field_samples_do_not_get_automatic_lake_indices(study):
-    r=app.parse_field_csv(b"site,date,latitude,longitude,chlorophyll_ug_l\nQA,2025-01-10,33.7,73.12,10\n",study,False)
-    assert not any(c.startswith("tsi_") for c in r["tables"]["Included field observations"])
 
 
 def test_formula_injection_neutralised_but_numeric_sign_preserved():
@@ -114,19 +81,8 @@ def test_radiometric_offset_and_nodata(tmp_path):
     assert np.isnan(arr[1,0])
 
 
-def test_provider_failure_does_not_create_data(study,monkeypatch):
-    def fail(*args,**kwargs):
-        raise app.DataError("Deliberate provider outage")
-    monkeypatch.setattr(app,"air_module",fail)
-    monkeypatch.setattr(app,"earthquake_module",lambda *args:app.result("Earthquakes"))
-    run=app.execute_analysis(study,{"modules":["Air quality","Earthquakes"]})
-    assert "Air quality" in run["errors"] and "Air quality" not in run["results"]
-    assert "Earthquakes" in run["results"]
 
 
-def test_agent_rejects_unlisted_tools(study):
-    run={"id":"test","study":study,"results":{},"errors":{}}
-    assert "error" in app.agent_tool(run,"run_shell",{"command":"anything"})
 
 
 def test_export_geojson_keeps_lon_lat_order(study):

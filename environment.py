@@ -1,8 +1,8 @@
-"""AquaTerra Research AI 1.0 — an evidence-first environmental research workbench.
+"""HydroScope Water Research 1.0 — an evidence-first environmental research workbench.
 
 Run: python -m streamlit run app.py
 Python 3.12. No supplied artwork is bundled. No key is needed
-for the environmental adapters; CrewAI handles the optional five-agent review.
+for water-data adapters; an optional single LLM call interprets saved results.
 See README.md and METHODS.md for coverage, attribution and scientific limits.
 """
 from __future__ import annotations
@@ -42,24 +42,19 @@ from shapely.ops import transform as shape_transform, unary_union
 from urllib3.util.retry import Retry
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "aquaterra-1.0.0"
+VERSION = "hydroscope-1.0.0"
 GEOD = Geod(ellps="WGS84")
 TEAL, VIOLET, GOLD = "#5FE1C3", "#A78BFA", "#F4C97A"
 COLORS = [TEAL, VIOLET, GOLD, "#76B8FF", "#F18BB8"]
 MAX_SAT_KM2, MAX_SAT_PIXELS = 250.0, 600_000
 SAT_COLLECTION = "sentinel-2-c1-l2a"
-MODULES = ["Climate", "Air quality", "Satellite", "River outlook", "Earthquakes", "Biodiversity", "US weather alerts"]
-PAGES = ["Overview", "Study & analysis", "Satellite & water", "Climate & air", "Hazards", "Ecology & field", "AI team", "Reports & sources"]
+MODULES = ["Satellite", "River outlook", "Marine outlook"]
+PAGES = ["Overview", "Water study", "Satellite water maps", "Water research", "River & marine", "AI interpretation", "Reports & sources"]
 FIELD_COLUMNS = ["site", "date", "latitude", "longitude", "chlorophyll_ug_l", "secchi_m", "total_phosphorus_ug_l", "dissolved_oxygen_mg_l", "ph", "temperature_c", "turbidity_ntu", "notes"]
 SOURCES = {
-    "Climate": "https://open-meteo.com/en/docs/historical-weather-api",
-    "Weather forecast": "https://open-meteo.com/en/docs",
-    "Air quality": "https://open-meteo.com/en/docs/air-quality-api",
     "Satellite": "https://github.com/Element84/earth-search",
     "River outlook": "https://open-meteo.com/en/docs/flood-api",
-    "Earthquakes": "https://earthquake.usgs.gov/fdsnws/event/1/",
-    "Biodiversity": "https://techdocs.gbif.org/en/openapi/v1/occurrence",
-    "US weather alerts": "https://www.weather.gov/documentation/services-web-api",
+    "Marine outlook": "https://open-meteo.com/en/docs/marine-weather-api",
     "Field observations": "https://www.nalms.org/secchidipin/monitoring-methods/trophic-state-equations/",
 }
 
@@ -86,7 +81,7 @@ def request_json(url, params=None, payload=None):
                   allowed_methods=frozenset(["GET"]), respect_retry_after_header=False)
     with requests.Session() as session:
         session.mount("https://", HTTPAdapter(max_retries=retry))
-        headers = {"User-Agent": "AquaTerraAI/1.0 environmental research dashboard",
+        headers = {"User-Agent": "HydroScope/1.0 water research dashboard",
                    "Accept": "application/json"}
         try:
             response = session.request("POST" if payload is not None else "GET", url,
@@ -174,7 +169,7 @@ def make_study(label, lat, lon, radius, start, end, custom=None):
     if end > date.today():
         raise DataError("The study period is historical. Forecasts use a separate future window.")
     if (end - start).days > 3660:
-        raise DataError("Limit the historical study to ten years per run. The optional baseline is 1991–2020.")
+        raise DataError("Limit the historical study to ten years per run. ")
     geom = normalize_geometry(custom or circle_geometry(lat, lon, radius))
     center = geom.centroid
     return {"label": str(label).strip()[:160] or "Selected study area", "lat": center.y,
@@ -221,204 +216,20 @@ def daily_frame(data):
     return frame
 
 
-@st.cache_data(ttl=3600, max_entries=20, show_spinner=False)
-def archive_data(lat, lon, start, end):
-    return request_json("https://archive-api.open-meteo.com/v1/archive", {
-        "latitude": lat, "longitude": lon, "start_date": start, "end_date": end,
-        "models": "era5", "timezone": "auto",
-        "daily": "temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,et0_fao_evapotranspiration"})
 
 
-def monthly_climate(daily):
-    d = daily.set_index("date")
-    g = d.resample("MS")
-    out = pd.DataFrame({"temperature_c": g["temperature_2m_mean"].mean(),
-                        "precipitation_mm": g["precipitation_sum"].sum(min_count=1),
-                        "precipitation_days_available": g["precipitation_sum"].count(),
-                        "temperature_days_available": g["temperature_2m_mean"].count()})
-    out["days_in_month"] = out.index.days_in_month
-    out["complete_month"] = (out.precipitation_days_available == out.days_in_month) & (out.temperature_days_available == out.days_in_month)
-    return out.reset_index()
 
 
-@st.cache_data(ttl=900, max_entries=16, show_spinner=False)
-def climate_module(study, baseline=False):
-    out = result("Climate")
-    last = min(date.fromisoformat(study["end"]), date.today() - timedelta(days=7))
-    if date.fromisoformat(study["start"]) <= last:
-        data, stamp = archive_data(study["lat"], study["lon"], study["start"], str(last))
-        daily = daily_frame(data)
-        monthly = monthly_climate(daily)
-        out["tables"]["Historical daily"] = daily
-        out["tables"]["Monthly climate"] = monthly
-        count = int(daily.precipitation_sum.notna().sum())
-        out["metrics"]["Historical precipitation (mm)"] = finite_stat(daily.precipitation_sum, "sum")
-        out["metrics"]["Mean air temperature (°C)"] = finite_stat(daily.temperature_2m_mean)
-        out["facts"].append(f"[C1] Available historical precipitation totals {fmt(out['metrics']['Historical precipitation (mm)'])} mm across {count}/{len(daily)} daily records; missing days are not replaced with zero.")
-        out["sources"].append(source_record("C1", "Open-Meteo / ERA5", "Reanalysis", stamp,
-            f"{study['start']} to {last}", "ERA5 approximately 0.25 degrees; daily summaries",
-            "Nearest model grid point to the study centroid; not an area mean.",
-            f"{data.get('latitude')}, {data.get('longitude')}", SOURCES["Climate"]))
-        if str(last) != study["end"]:
-            out["notes"].append(f"Historical analysis stops on {last}; a seven-day buffer avoids incomplete ERA5 updates.")
-        if baseline:
-            try:
-                b, bt = archive_data(study["lat"], study["lon"], "1991-01-01", "2020-12-31")
-                bm = monthly_climate(daily_frame(b))
-                bm = bm[bm.complete_month].copy()
-                bm["calendar_month"] = bm.date.dt.month
-                normals = bm.groupby("calendar_month").agg(
-                    baseline_temperature_c=("temperature_c", "mean"), baseline_precipitation_mm=("precipitation_mm", "mean"),
-                    baseline_years=("date", "count")).reset_index()
-                monthly["calendar_month"] = monthly.date.dt.month
-                monthly = monthly.merge(normals, on="calendar_month", how="left")
-                good = monthly.complete_month & (monthly.baseline_years >= 25)
-                monthly["temperature_anomaly_c"] = (monthly.temperature_c - monthly.baseline_temperature_c).where(good)
-                monthly["precipitation_anomaly_mm"] = (monthly.precipitation_mm - monthly.baseline_precipitation_mm).where(good)
-                out["tables"]["Monthly climate"] = monthly
-                out["tables"]["1991-2020 baseline"] = normals
-                out["sources"].append(source_record("C2", "Open-Meteo / ERA5", "Reanalysis baseline", bt,
-                    "1991-01-01 to 2020-12-31", "Same ERA5 grid / monthly normals",
-                    "Anomalies only for complete study months and baseline months with at least 25 complete years.", url=SOURCES["Climate"]))
-            except DataError as exc:
-                out["notes"].append(f"Baseline unavailable: {exc}")
-    else:
-        out["notes"].append("The selected period is too recent for the seven-day historical buffer. Only the current forecast is available.")
-    try:
-        data, stamp = request_json("https://api.open-meteo.com/v1/forecast", {
-            "latitude": study["lat"], "longitude": study["lon"], "timezone": "auto", "forecast_days": 7,
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max"})
-        forecast = daily_frame(data)
-        out["tables"]["Weather forecast"] = forecast
-        rain = finite_stat(forecast.precipitation_sum, "sum")
-        out["metrics"]["7-day forecast precipitation (mm)"] = rain
-        out["facts"].append(f"[C3] The currently retrieved seven-day weather forecast totals {fmt(rain)} mm of precipitation. This is a forecast, independent of the historical study period.")
-        out["sources"].append(source_record("C3", "Open-Meteo / best-match weather models", "Forecast", stamp,
-            f"{forecast.date.min().date()} to {forecast.date.max().date()}", "Model-dependent grid; daily summaries",
-            "Provider forecast; model issuance time not supplied by this response. Dates follow provider local timezone.",
-            f"{data.get('latitude')}, {data.get('longitude')}", SOURCES["Weather forecast"]))
-    except DataError as exc:
-        out["notes"].append(f"Weather forecast unavailable: {exc}")
-    out["notes"].append("Climate variables represent the centroid model cell. Short periods describe weather variability; they do not establish long-term climate change.")
-    out["notes"].append("Precipitation includes rain and the water equivalent of snow; it is not a rain-only measurement. This distinction matters at cold or high-altitude sites.")
-    if not out["tables"]:
-        raise DataError("No historical or forecast weather data were available.")
-    return out
 
 
-@st.cache_data(ttl=900, max_entries=16, show_spinner=False)
-def air_module(study):
-    data, stamp = request_json("https://air-quality-api.open-meteo.com/v1/air-quality", {
-        "latitude": study["lat"], "longitude": study["lon"], "timezone": "auto", "forecast_days": 5,
-        "hourly": "pm2_5,pm10,nitrogen_dioxide,ozone,us_aqi"})
-    frame = pd.DataFrame(data.get("hourly", {})).rename(columns={"time": "date"})
-    if frame.empty:
-        raise DataError("No air-quality records were returned.")
-    frame.date = pd.to_datetime(frame.date)
-    out = result("Air quality")
-    out["tables"]["Air quality hourly"] = frame
-    out["metrics"]["Peak forecast PM2.5 (µg/m³)"] = finite_stat(frame.pm2_5, "max")
-    out["facts"].append(f"[A1] Modelled PM2.5 reaches {fmt(out['metrics']['Peak forecast PM2.5 (µg/m³)'])} µg/m³ in the retrieved five-day window.")
-    out["sources"].append(source_record("A1", "Open-Meteo / CAMS", "Model estimate and forecast", stamp,
-        f"{frame.date.min()} to {frame.date.max()}", "CAMS regional/global grid; model-dependent",
-        "Hourly centroid grid-cell concentrations; AQI is the provider's US AQI. Issue time unavailable.",
-        f"{data.get('latitude')}, {data.get('longitude')}", SOURCES["Air quality"]))
-    out["notes"].append("These are model estimates, not readings from a local air sensor. The window begins today, independent of the historical study dates.")
-    return out
 
 
-@st.cache_data(ttl=900, max_entries=16, show_spinner=False)
-def flood_module(study, threshold=0.0):
-    data, stamp = request_json("https://flood-api.open-meteo.com/v1/flood", {
-        "latitude": study["lat"], "longitude": study["lon"], "forecast_days": 7,
-        "daily": "river_discharge,river_discharge_p25,river_discharge_p75"})
-    frame = daily_frame(data)
-    if frame.river_discharge.notna().sum() == 0:
-        raise DataError("No modelled river discharge is available for this location.")
-    out = result("River outlook")
-    out["tables"]["Discharge forecast"] = frame
-    out["metrics"]["Peak modelled flow (m³/s)"] = finite_stat(frame.river_discharge, "max")
-    out["facts"].append(f"[F1] Peak modelled discharge is {fmt(out['metrics']['Peak modelled flow (m³/s)'])} m³/s. The selected river cell requires local verification.")
-    if threshold > 0:
-        frame["above_user_threshold"] = frame.river_discharge > threshold
-        out["facts"].append(f"[F1] {int(frame.above_user_threshold.sum())} forecast days exceed the user-supplied screening threshold of {threshold:g} m³/s. This threshold is not independently validated by AquaTerra.")
-    out["sources"].append(source_record("F1", "Open-Meteo / GloFAS provider default", "Hydrological forecast", stamp,
-        f"{frame.date.min().date()} to {frame.date.max().date()}", "Approximately 5 km / daily",
-        "Provider default river-discharge forecast; p25–p75 is ensemble spread, not a calibrated confidence interval. Model version and issue time are not echoed by the API response.",
-        f"{data.get('latitude')}, {data.get('longitude')}", SOURCES["River outlook"]))
-    out["notes"].extend(["River identity and gauge calibration have not been verified. A lake or small stream may resolve to a different modelled river.",
-                         "Discharge is not flood depth, inundation extent, flash-flood probability or an official warning."])
-    return out
 
 
-@st.cache_data(ttl=900, max_entries=16, show_spinner=False)
-def earthquake_module(study, radius_km=150, min_magnitude=2.5):
-    end = min(datetime.combine(date.fromisoformat(study["end"]) + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc), datetime.now(timezone.utc))
-    data, stamp = request_json("https://earthquake.usgs.gov/fdsnws/event/1/query", {
-        "format": "geojson", "latitude": study["lat"], "longitude": study["lon"], "maxradiuskm": radius_km,
-        "starttime": study["start"], "endtime": end.isoformat(), "minmagnitude": min_magnitude,
-        "limit": 1000, "orderby": "time"})
-    rows = []
-    for feature in data.get("features", []):
-        p, coords = feature["properties"], feature["geometry"]["coordinates"]
-        rows.append({"event_id": feature["id"], "date": pd.to_datetime(p.get("time"), unit="ms", utc=True).tz_localize(None),
-            "longitude": coords[0], "latitude": coords[1], "depth_km": coords[2], "magnitude": p.get("mag"),
-            "magnitude_type": p.get("magType"), "place": p.get("place"), "review_status": p.get("status"), "url": p.get("url")})
-    frame = pd.DataFrame(rows, columns=["event_id", "date", "longitude", "latitude", "depth_km", "magnitude", "magnitude_type", "place", "review_status", "url"])
-    out = result("Earthquakes")
-    out["tables"]["Earthquake events"] = frame
-    out["metrics"]["Retrieved earthquakes"] = len(frame)
-    out["facts"].append(f"[E1] Retrieved {len(frame)} catalogue events with magnitude ≥ {min_magnitude:g} within {radius_km:g} km of the study centroid; maximum 1,000 newest events.")
-    out["sources"].append(source_record("E1", "USGS earthquake catalogue", "Event observations", stamp,
-        f"{study['start']} to {study['end']}", f"Event points / {radius_km:g} km search radius",
-        "Magnitude types and review status retained; count is not a future hazard probability.", url=SOURCES["Earthquakes"]))
-    out["notes"].append("Earthquake timing, location and magnitude cannot be reliably predicted. Event density is not a seismic hazard map; catalogue completeness varies.")
-    return out
 
 
-@st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
-def biodiversity_module(study):
-    west, south, east, north = study["bbox"]
-    params = {"decimalLatitude": f"{south},{north}", "decimalLongitude": f"{west},{east}",
-        "eventDate": f"{study['start']},{study['end']}", "hasCoordinate": "true", "hasGeospatialIssue": "false", "limit": 300}
-    data, stamp = request_json("https://api.gbif.org/v1/occurrence/search", params)
-    geom, rows = shape(study["geometry"]), []
-    for r in data.get("results", []):
-        lat, lon = r.get("decimalLatitude"), r.get("decimalLongitude")
-        if lat is None or lon is None or not geom.covers(Point(lon, lat)):
-            continue
-        rows.append({"gbif_id": r.get("key"), "species": r.get("species", r.get("scientificName")),
-            "date": r.get("eventDate"), "latitude": lat, "longitude": lon, "basis": r.get("basisOfRecord"),
-            "coordinate_uncertainty_m": r.get("coordinateUncertaintyInMeters"), "dataset": r.get("datasetKey"),
-            "license": r.get("license"), "occurrence_url": f"https://www.gbif.org/occurrence/{r.get('key')}"})
-    frame = pd.DataFrame(rows, columns=["gbif_id", "species", "date", "latitude", "longitude", "basis", "coordinate_uncertainty_m", "dataset", "license", "occurrence_url"])
-    out = result("Biodiversity")
-    out["tables"]["Species occurrences"] = frame
-    if not frame.empty:
-        out["tables"]["Recorded taxa"] = frame.groupby("species", dropna=False).size().reset_index(name="records").sort_values("records", ascending=False)
-    out["metrics"]["Recorded taxa in retrieved subset"] = frame.species.nunique()
-    out["facts"].append(f"[B1] {len(frame)} records and {frame.species.nunique()} named taxa fall inside the study polygon in the retrieved subset. The bounding-box query matched {data.get('count', 'an unknown number of')} records; retrieval is capped at 300.")
-    out["sources"].append(source_record("B1", "GBIF and contributing datasets", "Occurrence observations", stamp,
-        f"{study['start']} to {study['end']}", "Point records; positional uncertainty varies",
-        "Bounding-box search followed by polygon filtering; capped subset, not a complete inventory. Retain record licences and attribution.", url=SOURCES["Biodiversity"]))
-    out["notes"].append("Recorded taxa reflect sampling effort and reporting bias. Empty results do not show ecological absence, and record counts are not animal abundance.")
-    return out
 
 
-@st.cache_data(ttl=300, max_entries=12, show_spinner=False)
-def alerts_module(study):
-    data, stamp = request_json("https://api.weather.gov/alerts/active", {"point": f"{study['lat']:.4f},{study['lon']:.4f}"})
-    rows = []
-    for feature in data.get("features", []):
-        p = feature.get("properties", {})
-        rows.append({k: p.get(k) for k in ["event", "severity", "certainty", "urgency", "headline", "sent", "expires", "description", "instruction", "senderName"]})
-    out = result("US weather alerts")
-    out["tables"]["Official US alerts"] = pd.DataFrame(rows)
-    out["facts"].append(f"[W1] Retrieved {len(rows)} currently active US NWS alerts for this point. An empty response does not establish safety or coverage outside the US service area.")
-    out["sources"].append(source_record("W1", "US National Weather Service", "Official alert feed", stamp,
-        "Currently active alerts", "Alert service area", "US service coverage only; alert issue and expiry retained.", url=SOURCES["US weather alerts"]))
-    out["notes"].append("This adapter covers US NWS alerts only. For Pakistan, consult PMD and NDMA official advisories. AquaTerra does not predict tornado formation.")
-    return out
 
 
 @st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
@@ -539,14 +350,13 @@ def process_satellite_item(item, study, grid, water_threshold=0.0):
     rgb = np.stack([bands["red"], bands["green"], bands["blue"]], axis=-1)
     rgb = np.clip(np.nan_to_num(rgb) / 0.3, 0, 1) ** (1 / 1.8)
     rgb[~valid] = 0
-    arrays = {"NDVI": ndvi, "NDWI": ndwi, "MNDWI": mndwi, "NDCI": ndci,
+    arrays = {"NDWI": ndwi, "MNDWI": mndwi, "NDCI": ndci,
               "Water red reflectance": redwater, "Water mask": np.where(valid, water.astype(float), np.nan).astype("float32")}
     pixel_km2 = resolution ** 2 / 1e6
     summary = {"scene_id": item["id"], "date": item["properties"]["datetime"],
         "scene_cloud_percent": item["properties"].get("eo:cloud_cover"),
         "valid_aoi_percent": 100 * valid.sum() / max(1, inside.sum()),
         "screened_water_km2": float(water.sum() * pixel_km2), "water_pixels": int(water.sum()),
-        "median_ndvi": float(np.nanmedian(ndvi)) if np.isfinite(ndvi).any() else np.nan,
         "median_water_ndci": float(np.nanmedian(ndci)) if np.isfinite(ndci).any() else np.nan,
         "median_water_red_reflectance": float(np.nanmedian(redwater)) if np.isfinite(redwater).any() else np.nan,
         "grid_resolution_m": resolution, "collection": item.get("collection", SAT_COLLECTION)}
@@ -638,86 +448,8 @@ def satellite_module(study, scene_count=3, cloud_limit=40, water_threshold=0.0):
     return out
 
 
-def parse_field_csv(contents, study, lake_indices=False):
-    if len(contents) > 5_000_000:
-        raise DataError("Keep the field CSV below 5 MB.")
-    try:
-        frame = pd.read_csv(io.BytesIO(contents))
-    except Exception as exc:
-        raise DataError("Could not read this CSV. Use the supplied UTF-8 template.") from exc
-    frame.columns = [str(c).strip().lower() for c in frame.columns]
-    if frame.columns.duplicated().any():
-        raise DataError("CSV column names must be unique.")
-    if not {"site", "date", "latitude", "longitude"}.issubset(frame.columns):
-        raise DataError("Required CSV columns: site, date, latitude, longitude.")
-    if frame.empty or len(frame) > 10_000:
-        raise DataError("Provide between 1 and 10,000 observation rows.")
-    frame = frame[[c for c in FIELD_COLUMNS if c in frame]].copy()
-    dates = pd.to_datetime(frame.date, errors="coerce", utc=True)
-    if dates.isna().any():
-        raise DataError("Every row needs a valid observation date (YYYY-MM-DD).")
-    frame.date = dates.dt.tz_localize(None)
-    numeric = [c for c in FIELD_COLUMNS if c not in ["site", "date", "notes"] and c in frame]
-    for col in numeric:
-        original = frame[col]
-        values = pd.to_numeric(original, errors="coerce")
-        if (original.notna() & values.isna()).any() or np.isinf(values).any():
-            raise DataError(f"{col} contains non-numeric or infinite values. Missing measurements should be blank.")
-        frame[col] = values
-    if frame[["latitude", "longitude"]].isna().any().any() or not frame.latitude.between(-90, 90).all() or not frame.longitude.between(-180, 180).all():
-        raise DataError("Every row needs valid latitude/longitude coordinates.")
-    for col in numeric:
-        if col not in ["latitude", "longitude", "temperature_c", "ph"] and (frame[col].dropna() < 0).any():
-            raise DataError(f"{col} cannot contain negative measurements.")
-    if "ph" in frame and not frame.ph.dropna().between(0, 14).all():
-        raise DataError("pH must be between 0 and 14.")
-    geom = shape(study["geometry"])
-    frame["inside_study"] = [geom.covers(Point(lon, lat)) for lon, lat in zip(frame.longitude, frame.latitude)]
-    frame["within_period"] = frame.date.dt.date.between(date.fromisoformat(study["start"]), date.fromisoformat(study["end"]))
-    frame["included"] = frame.inside_study & frame.within_period
-    if lake_indices:
-        equations = {"chlorophyll_ug_l": (9.81, 30.6, "tsi_chlorophyll"),
-                     "secchi_m": (-14.41, 60.0, "tsi_secchi"),
-                     "total_phosphorus_ug_l": (14.42, 4.15, "tsi_phosphorus")}
-        for col, (a, b, target) in equations.items():
-            if col in frame:
-                vals = frame[col].where(frame[col] > 0)
-                frame[target] = a * np.log(vals) + b
-    out = result("Field observations")
-    out["tables"]["Field observations audit"] = frame
-    out["tables"]["Included field observations"] = frame[frame.included].copy()
-    out["metrics"]["Included field observations"] = int(frame.included.sum())
-    out["facts"].append(f"[U1] {int(frame.included.sum())}/{len(frame)} uploaded observations fall inside both the study polygon and study period. Uploaded observations remain user-supplied and unverified.")
-    out["sources"].append(source_record("U1", "User-supplied field CSV", "Field observations — unverified", utc_now(),
-        f"{frame.date.min()} to {frame.date.max()}", "Sampling coordinates; accuracy not independently known",
-        "Units are encoded in column names. Carlson indices, when selected, are computed separately; zero/missing inputs have no log-based index.", url=SOURCES["Field observations"]))
-    out["notes"].extend(["Excluded observations are retained in the audit table, but do not enter study summaries or sampling maps.",
-        "Carlson indices are intended for appropriate lake/reservoir contexts. Non-algal turbidity and other conditions can invalidate interpretation. The three indices are not averaged.",
-        "No inference of drinking-water safety, pathogens, nutrient concentrations or dissolved oxygen is made from satellite indices."])
-    return out
 
 
-def execute_analysis(study, options, progress=None):
-    run = {"id": hashlib.sha256((json.dumps(study, sort_keys=True) + str(time.time_ns())).encode()).hexdigest()[:12],
-           "created_utc": utc_now(), "version": VERSION, "study": study, "options": options,
-           "results": {}, "errors": {}}
-    adapters = {
-        "Climate": lambda: climate_module(study, options.get("baseline", False)),
-        "Air quality": lambda: air_module(study),
-        "Satellite": lambda: satellite_module(study, options.get("scene_count", 3), options.get("cloud_limit", 40), options.get("water_threshold", 0.0)),
-        "River outlook": lambda: flood_module(study, options.get("flow_threshold", 0)),
-        "Earthquakes": lambda: earthquake_module(study, options.get("quake_radius", 150), options.get("min_magnitude", 2.5)),
-        "Biodiversity": lambda: biodiversity_module(study),
-        "US weather alerts": lambda: alerts_module(study),
-    }
-    for module in options.get("modules", []):
-        if progress:
-            progress(f"Retrieving and checking {module.lower()}…")
-        try:
-            run["results"][module] = adapters[module]()
-        except Exception as exc:
-            run["errors"][module] = str(exc)[:800] if isinstance(exc, DataError) else f"{type(exc).__name__}: this module could not complete. Check the source status and retry."
-    return run
 
 
 def all_sources(run):
@@ -728,39 +460,6 @@ def all_tables(run):
     return [(module, name, frame) for module, r in run["results"].items() for name, frame in r.get("tables", {}).items()]
 
 
-def chart_specs(run):
-    specs = []
-    def add(module, table, title, x, ys, units, kind="line", eid=""):
-        frame = run["results"].get(module, {}).get("tables", {}).get(table)
-        if frame is None or frame.empty or x not in frame:
-            return
-        columns = [y for y in ys if y in frame and pd.to_numeric(frame[y], errors="coerce").notna().any()]
-        if columns:
-            spec = {"title": title, "module": module, "table": table, "df": frame.copy(), "x": x,
-                    "ys": columns, "units": units, "kind": kind, "evidence": eid}
-            if x == "date" and kind == "scatter":
-                spec["date_range"] = [run["study"]["start"], run["study"]["end"]]
-            if table == "Monthly climate":
-                spec["df"]["covered_month"] = [f"{pd.Timestamp(row.date):%b %Y} ({int(row.precipitation_days_available)}/{int(row.days_in_month)} days)" for row in frame.itertuples()]
-                spec["x"] = "covered_month"
-            specs.append(spec)
-    add("Climate", "Historical daily", "Historical air temperature", "date", ["temperature_2m_mean"], "°C", eid="C1")
-    add("Climate", "Monthly climate", "Monthly precipitation — actual covered days shown", "date", ["precipitation_mm"], "mm", "bar", "C1")
-    add("Climate", "Monthly climate", "Temperature departures from 1991–2020", "date", ["temperature_anomaly_c"], "°C departure", "bar", "C1 / C2")
-    add("Climate", "Weather forecast", "Seven-day precipitation forecast", "date", ["precipitation_sum"], "mm", "bar", "C3")
-    add("Climate", "Weather forecast", "Seven-day temperature range", "date", ["temperature_2m_min", "temperature_2m_max"], "°C", eid="C3")
-    add("Air quality", "Air quality hourly", "Modelled particulate matter", "date", ["pm2_5", "pm10"], "µg/m³", eid="A1")
-    add("Air quality", "Air quality hourly", "Provider US Air Quality Index", "date", ["us_aqi"], "US AQI", eid="A1")
-    add("River outlook", "Discharge forecast", "River discharge forecast and ensemble quartiles", "date", ["river_discharge", "river_discharge_p25", "river_discharge_p75"], "m³/s", eid="F1")
-    add("Earthquakes", "Earthquake events", "Earthquake magnitudes through time", "date", ["magnitude"], "Catalogue magnitude (type retained in data)", "scatter", "E1")
-    add("Biodiversity", "Recorded taxa", "Most frequently recorded taxa in retrieved subset", "species", ["records"], "Occurrence records", "horizontal", "B1")
-    scenes = run["results"].get("Satellite", {}).get("tables", {}).get("Satellite scene statistics")
-    if scenes is not None and not scenes.empty and scenes.screened_water_km2.gt(0).any():
-        add("Satellite", "Satellite scene statistics", "Screened water area on selected dates", "date", ["screened_water_km2"], "km² within each clear footprint", eid="S1")
-    add("Satellite", "Satellite scene statistics", "Median water NDCI on selected dates", "date", ["median_water_ndci"], "Dimensionless NDCI", eid="S1")
-    add("Field observations", "Included field observations", "Field chlorophyll measurements", "date", ["chlorophyll_ug_l"], "µg/L", "scatter", "U1")
-    add("Field observations", "Included field observations", "Individual Carlson indices from uploaded samples", "date", ["tsi_chlorophyll", "tsi_secchi", "tsi_phosphorus"], "Carlson TSI — separate indices", "scatter", "U1")
-    return specs
 
 
 def interactive_chart(spec):
@@ -787,7 +486,7 @@ def interactive_chart(spec):
 
 def figure_png(fig):
     buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=145, bbox_inches="tight", facecolor="white")
+    fig.savefig(buffer, format="png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return buffer.getvalue()
 
@@ -800,14 +499,7 @@ def plot_static(spec):
         if spec["kind"] == "horizontal":
             ax.barh(df[spec["x"]].fillna("Unspecified").astype(str), df[y], color=color)
         elif spec["kind"] == "bar":
-            if spec["table"] == "Monthly climate":
-                bars = ax.bar(df[spec["x"]], df[y], color=color, label=y, width=.65)
-                for bar, complete in zip(bars, df.complete_month):
-                    if not complete:
-                        bar.set_hatch("//")
-                        bar.set_edgecolor("#334155")
-            else:
-                ax.bar(df[spec["x"]], df[y], color=color, label=y, width=.7)
+            ax.bar(df[spec["x"]], df[y], color=color, label=y, width=.7)
         elif spec["kind"] == "scatter":
             ax.scatter(df[spec["x"]], df[y], color=color, s=22, alpha=.8, label=y)
         else:
@@ -824,8 +516,7 @@ def plot_static(spec):
         ax.legend(fontsize=7)
     if spec["kind"] != "horizontal":
         fig.autofmt_xdate()
-    extra = " | Hatched bars = partial months" if spec["table"] == "Monthly climate" else ""
-    fig.text(.12, -.015, f"Evidence: {spec['evidence']} | AquaTerra Research AI{extra}", fontsize=8, color="#526174")
+    fig.text(.12, -.015, f"Evidence: {spec['evidence']} | HydroScope Water Research", fontsize=8, color="#526174")
     return figure_png(fig)
 
 
@@ -840,57 +531,9 @@ def draw_boundary(ax, study):
             ax.fill(hx, hy, color="white")
 
 
-def point_map_png(run, module=None):
-    fig, ax = plt.subplots(figsize=(9.2, 5.4))
-    draw_boundary(ax, run["study"])
-    if module == "Earthquakes":
-        radius = run.get("options", {}).get("quake_radius", 150)
-        search = shape(circle_geometry(run["study"]["lat"], run["study"]["lon"], radius))
-        sx, sy = search.exterior.xy
-        ax.plot(sx, sy, color="#7552AD", linestyle="--", linewidth=1, label=f"{radius:g} km search radius")
-    title = "Study boundary and sampling locations"
-    table_names = ["Sampling candidates", "Included field observations"]
-    for name, table_name, frame in all_tables(run):
-        if module == "Earthquakes" and table_name == "Earthquake events":
-            if not frame.empty:
-                mag = pd.to_numeric(frame.magnitude, errors="coerce").fillna(0)
-                depths = pd.to_numeric(frame.depth_km, errors="coerce")
-                colours = {"c": depths, "cmap": "viridis_r"} if depths.nunique() > 1 else {"color": "#087F8C"}
-                points = ax.scatter(frame.longitude, frame.latitude, s=(np.maximum(mag, 0)+1)**2*7,
-                                    **colours, alpha=.75, edgecolors="white", linewidth=.35)
-                if depths.nunique() > 1:
-                    fig.colorbar(points, ax=ax, label="Depth (km)", shrink=.7, pad=.03)
-                elif depths.notna().any():
-                    ax.text(.02, .03, f"Event depth: {depths.dropna().iloc[0]:g} km", transform=ax.transAxes, fontsize=8)
-                for m in [3, 5, 7]:
-                    ax.scatter([], [], s=(m+1)**2*7, color="#47628F", label=f"Magnitude {m}")
-                title = "Earthquake event map — catalogue history"
-        elif module == "Biodiversity" and table_name == "Species occurrences" and not frame.empty:
-            ax.scatter(frame.longitude, frame.latitude, s=24, c="#579242", alpha=.7,
-                       edgecolors="white", linewidth=.3, label="Occurrence locations", zorder=4)
-            title = "Recorded biodiversity — retrieved subset"
-        elif module is None and table_name in table_names and not frame.empty:
-            color = "#7552AD" if table_name == "Sampling candidates" else "#BA7900"
-            ax.scatter(frame.longitude, frame.latitude, s=38, c=color, edgecolors="white", label=table_name, zorder=4)
-    ax.set_title(title, loc="left", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Longitude (WGS84)")
-    ax.set_ylabel("Latitude (WGS84)")
-    ax.set_aspect(1 / max(.1, math.cos(math.radians(run["study"]["lat"]))))
-    ax.grid(alpha=.2)
-    ax.ticklabel_format(style="plain", useOffset=False)
-    from matplotlib.ticker import MaxNLocator
-    ax.xaxis.set_major_locator(MaxNLocator(5))
-    ax.yaxis.set_major_locator(MaxNLocator(5))
-    handles, labels = ax.get_legend_handles_labels()
-    unique = dict(zip(labels, handles))
-    if unique:
-        ax.legend(unique.values(), unique.keys(), fontsize=7, loc="upper center", bbox_to_anchor=(.5, -.17), ncol=3)
-    ax.annotate("N", xy=(.95, .94), xytext=(.95, .82), xycoords="axes fraction", ha="center", arrowprops=dict(arrowstyle="->"))
-    fig.text(.08, -.15, "Coordinate map; no basemap imagery. The study boundary is local and does not delineate a river basin.", fontsize=7)
-    return figure_png(fig)
 
 
-RASTER_STYLES = {"NDVI": ("RdYlGn", -1, 1), "NDWI": ("BrBG", -1, 1),
+RASTER_STYLES = {"NDWI": ("BrBG", -1, 1),
                  "MNDWI": ("BrBG", -1, 1), "NDCI": ("viridis", -.3, .6),
                  "Water red reflectance": ("YlOrBr", 0, .15), "Water mask": ("Blues", 0, 1)}
 
@@ -983,7 +626,7 @@ def geotiff_bytes(raster):
 def feature_collection(run):
     features = [{"type": "Feature", "geometry": run["study"]["geometry"], "properties": {"layer": "Study boundary", "name": run["study"]["label"]}}]
     for module, name, frame in all_tables(run):
-        if name not in ["Sampling candidates", "Included field observations", "Earthquake events", "Species occurrences"] or frame.empty:
+        if name not in ["Sampling candidates", "Included field observations"] or frame.empty:
             continue
         for row in json.loads(frame.to_json(orient="records", date_format="iso")):
             if row.get("latitude") is None or row.get("longitude") is None:
@@ -993,28 +636,14 @@ def feature_collection(run):
     return {"type": "FeatureCollection", "features": features}
 
 
-def report_scope_notes(run):
-    study = run["study"]
-    notes = [f"Local study only: {study['area_km2']:.3f} km² around {study['lat']:.5f}, {study['lon']:.5f}. A place or river name is a label; this boundary is not the full named river or its catchment.",
-             "Climate and air values represent model cells near the study centroid, not measurements or averages for the entire river basin."]
-    scenes = run["results"].get("Satellite", {}).get("tables", {}).get("Satellite scene statistics")
-    if scenes is not None and not scenes.empty:
-        last = scenes.iloc[-1]
-        if pd.to_numeric(scenes.water_pixels, errors="coerce").fillna(0).eq(0).all():
-            notes.append("No selected scene produced screened water pixels. Water-quality / eutrophication interpretation and water-area change are unavailable. Zero detections do not prove no water, clean water or stable river extent.")
-        if float(last.valid_aoi_percent) < 50:
-            notes.append(f"The latest satellite scene has {float(last.valid_aoi_percent):.1f}% usable study-area coverage. Conditions in the masked area are unknown.")
-    if "River outlook" not in run["results"]:
-        notes.append("This run contains no river-discharge forecast or flood assessment.")
-    return notes
 
 
-def current_crew_review(run):
-    review = run.get("crew_review")
+def current_interpretation(run):
+    review = run.get("interpretation")
     if review:
-        from evidence import review_is_current
-        if not review_is_current(run, review):
-            raise DataError("The AI review is incomplete or belongs to different evidence. Run the team again before including it.")
+        from evidence import interpretation_is_current
+        if not interpretation_is_current(run, review):
+            raise DataError("The AI review is incomplete or belongs to different evidence. Generate a new interpretation before including it.")
     return review
 
 
@@ -1022,10 +651,10 @@ def build_html_report(run, figures):
     e = lambda x: html.escape(str(x))
     study = run["study"]
     parts = ["<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
-        "<title>AquaTerra Research AI report</title><style>body{font:15px/1.65 system-ui;color:#172638;background:#f2f5f8;margin:0}main{max-width:1050px;margin:auto;padding:38px;background:white}header{background:#12132c;color:white;padding:35px;border-top:6px solid #5fe1c3;border-radius:15px}h1{font-size:32px}h2{color:#087f8c;margin-top:35px}h3{color:#5a437b}table{border-collapse:collapse;width:100%;font-size:12px;display:block;overflow:auto}td,th{border:1px solid #dfe5ec;padding:7px;text-align:left}th{background:#edf5f4}figure{margin:28px 0;break-inside:avoid}img{width:100%;max-width:950px}figcaption,.note{color:#58677b;font-size:12px}.warning{background:#fff4dc;padding:16px}.source{overflow-wrap:anywhere}li{margin:7px 0}@media print{body{background:white}main{padding:0}header{-webkit-print-color-adjust:exact}h2{break-after:avoid}}</style><main>",
-        f"<header><p>AQUATERRA RESEARCH AI · ENVIRONMENTAL INTELLIGENCE</p><h1>{e(study['label'])}</h1><p>{e(study['start'])} — {e(study['end'])}</p><p>Run {e(run['id'])} · generated {e(run['created_utc'])}</p></header>",
+        "<title>HydroScope Water Research report</title><style>body{font:15px/1.65 system-ui;color:#172638;background:#f2f5f8;margin:0}main{max-width:1050px;margin:auto;padding:38px;background:white}header{background:#12132c;color:white;padding:35px;border-top:6px solid #5fe1c3;border-radius:15px}h1{font-size:32px}h2{color:#087f8c;margin-top:35px}h3{color:#5a437b}table{border-collapse:collapse;width:100%;font-size:12px;display:block;overflow:auto}td,th{border:1px solid #dfe5ec;padding:7px;text-align:left}th{background:#edf5f4}figure{margin:28px 0;break-inside:avoid}img{width:100%;max-width:950px}figcaption,.note{color:#58677b;font-size:12px}.warning{background:#fff4dc;padding:16px}.source{overflow-wrap:anywhere}li{margin:7px 0}@media print{body{background:white}main{padding:0}header{-webkit-print-color-adjust:exact}h2{break-after:avoid}}</style><main>",
+        f"<header><p>HYDROSCOPE WATER RESEARCH · WATER RESEARCH</p><h1>{e(study['label'])}</h1><p>{e(study['start'])} — {e(study['end'])}</p><p>Run {e(run['id'])} · generated {e(run['created_utc'])}</p></header>",
         f"<p>Study area: {study['area_km2']:.3f} km² · {e(study['boundary'])} · centroid {study['lat']:.5f}, {study['lon']:.5f}. Forecast windows are stated separately.</p>",
-        "<div class='warning'>Research and screening report. Satellite indicators require field validation. River forecasts require local river/gauge checks. Earthquake prediction and worldwide tornado prediction are not provided. Consult official authorities for emergency decisions.</div>",
+        "<div class='warning'>Research and screening report. Satellite indicators require field validation. River forecasts require local river/gauge checks. Marine model output is not suitable for navigation or water-safety decisions.</div>",
         "<h2>Coverage and unavailable evidence</h2><ul>" + "".join(f"<li>{e(n)}</li>" for n in report_scope_notes(run)) + "</ul>",
         "<h2>Executive findings</h2><ul>"]
     for r in run["results"].values():
@@ -1035,10 +664,10 @@ def build_html_report(run, figures):
         parts.append("<p>No data module completed. This report documents the unsuccessful retrieval; it does not assess environmental conditions.</p>")
     if run["errors"]:
         parts.append("<h2>Unavailable modules</h2><ul>" + "".join(f"<li>{e(k)}: {e(v)}</li>" for k,v in run["errors"].items()) + "</ul>")
-    review = current_crew_review(run)
+    review = current_interpretation(run)
     if review:
-        parts.append("<h2>Five-agent AI review</h2><p class='note'>AI-generated interpretation. All five agents completed; this is not independent scientific validation. Verify the cited evidence.</p>")
-        parts.append(f"<p>Pattern: sequential · Model: {e(review['model'])} · Generated: {e(review['generated_utc'])}</p>")
+        parts.append("<h2>Optional AI interpretation</h2><p class='note'>AI-generated interpretation. This is a single-model explanation of saved calculations, not independent scientific validation. Verify the cited evidence.</p>")
+        parts.append(f"<p>Model: {e(review['model'])} · Generated: {e(review['generated_utc'])}</p>")
         parts.append("<div style='white-space:pre-wrap;overflow-wrap:anywhere'>" + e(review["answer"]) + "</div>")
     parts.append("<h2>Maps and figures</h2>")
     for title, content in figures:
@@ -1052,7 +681,7 @@ def build_html_report(run, figures):
     parts.append("<h2>Recommended follow-up</h2><ul><li>Verify the study boundary and the spatial support of each dataset.</li><li>Sample candidate water locations and compare measurements with satellite acquisition dates.</li><li>Confirm river-cell identity and local gauge thresholds before interpreting discharge forecasts.</li><li>Retain missing-data and uncertainty notes when sharing results.</li></ul><h2>Sources and reproducibility</h2>")
     for s in all_sources(run):
         parts.append("<p class='source'>" + "<br>".join(f"<b>{e(k.replace('_',' '))}:</b> {e(v)}" for k,v in s.items()) + "</p>")
-    parts.append(f"<p class='note'>AquaTerra Research AI v{VERSION}. Accompanying metadata.json retains the selected boundary and analysis settings. No sample data were substituted for failed sources.</p></main></html>")
+    parts.append(f"<p class='note'>HydroScope Water Research v{VERSION}. Accompanying metadata.json retains the selected boundary and analysis settings. No sample data were substituted for failed sources.</p></main></html>")
     return "".join(parts).encode("utf-8")
 
 
@@ -1078,11 +707,11 @@ def build_pdf_report(run, figures):
     p = lambda text, style="BodyText": Paragraph(html.escape(str(text)), styles[style])
     output, flow = io.BytesIO(), []
     doc = SimpleDocTemplate(output, pagesize=A4, leftMargin=1.6*cm, rightMargin=1.6*cm,
-                            topMargin=1.8*cm, bottomMargin=1.8*cm, title=f"AquaTerra Research AI — {run['study']['label']}", author="AquaTerra Research AI")
-    flow += [p("AQUATERRA RESEARCH AI", "Title"), p(run["study"]["label"], "Heading1"),
+                            topMargin=1.8*cm, bottomMargin=1.8*cm, title=f"HydroScope Water Research — {run['study']['label']}", author="HydroScope Water Research")
+    flow += [p("HYDROSCOPE WATER RESEARCH", "Title"), p(run["study"]["label"], "Heading1"),
              p(f"Historical study: {run['study']['start']} to {run['study']['end']}"),
              p(f"Run {run['id']} | Generated {run['created_utc']}"), Spacer(1,.4*cm),
-             p(f"Boundary area {run['study']['area_km2']:.3f} km². Forecast windows are separate. Research/screening output; validate water indicators and river forecasts locally. No earthquake or worldwide tornado prediction is provided."),
+             p(f"Boundary area {run['study']['area_km2']:.3f} km². Forecast windows are separate. Research/screening output; validate water indicators and river forecasts locally. Marine output is not suitable for navigation or water-safety decisions."),
              p("Coverage and unavailable evidence", "Heading1")]
     flow.extend(p("• " + n) for n in report_scope_notes(run))
     flow.append(p("Executive findings", "Heading1"))
@@ -1092,10 +721,10 @@ def build_pdf_report(run, figures):
         flow.extend(p("• " + f) for f in r["facts"])
     for module, error in run["errors"].items():
         flow.append(p(f"Unavailable — {module}: {error}"))
-    review = current_crew_review(run)
+    review = current_interpretation(run)
     if review:
-        flow += [p("Five-agent AI review", "Heading1"),
-                 p("AI-generated interpretation; completion of the five-agent review is not independent scientific validation. Verify cited evidence."),
+        flow += [p("Optional AI interpretation", "Heading1"),
+                 p("AI-generated interpretation; this is a single-model explanation, not independent scientific validation. Verify cited evidence."),
                  p(f"Model: {review['model']} | Generated: {review['generated_utc']}")]
         for line in review["answer"].splitlines():
             if line.strip():
@@ -1137,21 +766,15 @@ def build_pdf_report(run, figures):
     def footer(canvas, document):
         canvas.setFont("EcoSans", 7)
         canvas.setFillColor(colors.HexColor("#607085"))
-        canvas.drawString(1.6*cm, 1*cm, f"AquaTerra Research AI | {run['id']} | Research and screening")
+        canvas.drawString(1.6*cm, 1*cm, f"HydroScope Water Research | {run['id']} | Research and screening")
         canvas.drawRightString(A4[0]-1.6*cm, 1*cm, str(document.page))
     doc.build(flow, onFirstPage=footer, onLaterPages=footer)
     return output.getvalue()
 
 
-def build_exports(run):
-    review = current_crew_review(run)
+def build_exports(run, additional_figures=None):
+    review = current_interpretation(run)
     figures = [("Study boundary and sampling map", point_map_png(run))]
-    eq = run["results"].get("Earthquakes", {}).get("tables", {}).get("Earthquake events")
-    if eq is not None and not eq.empty:
-        figures.append(("Earthquake bubble map", point_map_png(run, "Earthquakes")))
-    bio = run["results"].get("Biodiversity", {}).get("tables", {}).get("Species occurrences")
-    if bio is not None and not bio.empty:
-        figures.append(("Biodiversity occurrence map", point_map_png(run, "Biodiversity")))
     satellite = run["results"].get("Satellite", {}).get("raster")
     if satellite:
         for name in ["True colour", *RASTER_STYLES.keys()]:
@@ -1159,6 +782,7 @@ def build_exports(run):
                 continue
             figures.append((f"Satellite — {name}", raster_png(satellite, name)))
     figures.extend((s["title"], plot_static(s)) for s in chart_specs(run))
+    figures.extend(additional_figures or [])
     metadata = json.dumps(plain_metadata(run), indent=2, ensure_ascii=False, default=str).encode()
     html_bytes = build_html_report(run, figures)
     pdf_bytes = build_pdf_report(run, figures)
@@ -1191,8 +815,8 @@ def build_exports(run):
         z.writestr("analysis.xlsx", workbook.getvalue())
         z.writestr("metadata.json", metadata)
         if review:
-            z.writestr("ai/final_review.md",review["answer"])
-            z.writestr("ai/agent_review_and_activity.json",json.dumps(review,indent=2,ensure_ascii=False))
+            z.writestr("interpretation/results_interpretation.md",review["answer"])
+            z.writestr("interpretation/provenance.json",json.dumps(review,indent=2,ensure_ascii=False))
         z.writestr("maps/study_and_observations.geojson", json.dumps(feature_collection(run), ensure_ascii=False))
         if satellite:
             z.writestr("maps/satellite_indices.tif", geotiff_bytes(satellite))
@@ -1201,27 +825,95 @@ def build_exports(run):
             z.writestr(f"data/{i:02d}_{slug}.csv", safe_frame(frame).to_csv(index=False).encode("utf-8-sig"))
         for i, (title, data) in enumerate(figures, 1):
             z.writestr(f"figures/{i:02d}_{re.sub(r'[^a-zA-Z0-9]+', '_', title)[:70]}.png", data)
-        z.writestr("READ_ME.txt", "AquaTerra Research AI research output. See report limitations and metadata.json. CSV/XLSX contain full returned records. PDF/HTML tables are previews. Satellite GeoTIFF uses its recorded UTM CRS and -9999 nodata. Field observations remain unverified.\n")
+        z.writestr("READ_ME.txt", "HydroScope Water Research research output. See report limitations and metadata.json. CSV/XLSX contain full returned records. PDF/HTML tables are previews. Satellite GeoTIFF uses its recorded UTM CRS and -9999 nodata. Field observations remain unverified.\n")
     return {"pdf": pdf_bytes, "html": html_bytes, "xlsx": workbook.getvalue(), "zip": bundle.getvalue(), "metadata": metadata}
 
 
-def agent_tool(run, name, args):
-    if name == "get_evidence":
-        selected = args.get("module", "all")
-        return {"run_id": run["id"], "study": run["study"], "errors": run["errors"],
-            "modules": {m: {"facts": r["facts"], "notes": r["notes"], "sources": r["sources"],
-                "available_tables": {t: list(f.columns) for t,f in r["tables"].items()}}
-                for m,r in run["results"].items() if selected == "all" or selected == m}}
-    if name == "table_statistics":
-        module, table, column = (args.get(k, "") for k in ["module", "table", "column"])
-        frame = run["results"].get(module, {}).get("tables", {}).get(table)
-        if frame is None or column not in frame:
-            return {"error": "Unknown table or column. Call get_evidence for available names."}
-        values = pd.to_numeric(frame[column], errors="coerce").dropna()
-        if values.empty:
-            return {"error": "This column contains no numeric data."}
-        return {"module": module, "table": table, "column": column, "total_rows": len(frame), "valid_count": len(values),
-                "mean": float(values.mean()), "min": float(values.min()), "max": float(values.max()),
-                "median": float(values.median()), "sum": float(values.sum()),
-                "caution": "Choose statistics appropriate to units; summed indices/concentrations are generally not meaningful."}
-    return {"error": "Tool is not allowed."}
+
+
+def execute_analysis(study, options, progress=None):
+    from water_data import available_modules, river_module, marine_module
+    run = {"id": hashlib.sha256((json.dumps(study, sort_keys=True) + str(time.time_ns())).encode()).hexdigest()[:12],
+           "created_utc": utc_now(), "version": VERSION, "study": study, "options": options, "results": {}, "errors": {}}
+    allowed = available_modules(study["waterbody_type"])
+    adapters = {
+        "Satellite": lambda: satellite_module(study, options.get("scene_count", 3), options.get("cloud_limit", 40), options.get("water_threshold", 0)),
+        "River outlook": lambda: river_module(study, options.get("flow_threshold", 0)),
+        "Marine outlook": lambda: marine_module(study),
+    }
+    for name in options.get("modules", []):
+        if progress:
+            progress("Retrieving and checking " + name.lower() + "…")
+        try:
+            if name not in allowed:
+                raise DataError("This analysis is not available for the selected waterbody type.")
+            run["results"][name] = adapters[name]()
+        except Exception as exc:
+            run["errors"][name] = str(exc)[:600] if isinstance(exc, DataError) else f"{type(exc).__name__}: provider processing could not complete. No replacement data were created."
+    return run
+
+
+def chart_specs(run):
+    specs = []
+    def add(module, table, title, x, ys, units, eid, kind="line"):
+        f = run.get("results", {}).get(module, {}).get("tables", {}).get(table)
+        if f is None or f.empty or x not in f:
+            return
+        columns = [y for y in ys if y in f and pd.to_numeric(f[y], errors="coerce").notna().any()]
+        if columns:
+            frame = f.copy()
+            if x == "date":
+                frame[x] = pd.to_datetime(frame[x], utc=True, errors="coerce").dt.tz_localize(None)
+            specs.append({"title": title, "module": module, "table": table, "df": frame, "x": x,
+                          "ys": columns, "units": units, "kind": kind, "evidence": eid})
+    add("River outlook", "Discharge forecast", "Modelled discharge and ensemble quartiles", "date", ["river_discharge", "river_discharge_p25", "river_discharge_p75"], "m³/s", "F1")
+    add("River outlook", "Historical modelled discharge", "Historical modelled discharge — not gauge measurements", "date", ["river_discharge"], "m³/s", "F2")
+    for col, label, unit in [("sea_surface_temperature", "Modelled sea-surface temperature", "°C"),
+                             ("wave_height", "Significant wave height", "m"),
+                             ("ocean_current_velocity", "Modelled ocean current speed", "km/h"),
+                             ("sea_level_height_msl", "Modelled sea level relative to global MSL", "m")]:
+        add("Marine outlook", "Marine hourly forecast", label, "date", [col], unit, "M1")
+    add("Satellite", "Satellite scene statistics", "Screened water area within each clear footprint", "date", ["screened_water_km2"], "km²", "S1")
+    add("Satellite", "Satellite scene statistics", "Median water NDCI on selected dates", "date", ["median_water_ndci"], "Dimensionless index", "S1")
+    for col, unit in [("chlorophyll_ug_l", "µg/L"), ("turbidity_ntu", "NTU"), ("secchi_m", "m"),
+                      ("temperature_c", "°C"), ("dissolved_oxygen_mg_l", "mg/L"), ("salinity_psu", "PSU")]:
+        add("Field observations", "Included field observations", "Field measurements: " + col, "date", [col], unit, "U1", "scatter")
+    return specs
+
+
+def point_map_png(run, module=None):
+    fig, ax = plt.subplots(figsize=(9.2, 5.4))
+    draw_boundary(ax, run["study"])
+    for _, name, frame in all_tables(run):
+        if name not in ("Sampling candidates", "Included field observations") or frame.empty:
+            continue
+        f = frame.dropna(subset=["latitude", "longitude"])
+        if f.empty:
+            continue
+        sizes = 38
+        label = name
+        if name == "Included field observations" and "chlorophyll_ug_l" in f:
+            # Draw non-missing measurements with area proportional to magnitude, with display bounds.
+            sizes = np.clip(pd.to_numeric(f.chlorophyll_ug_l, errors="coerce").fillna(0).to_numpy() * 6, 18, 320)
+            label += " (bubble size: chlorophyll; capped)"
+        ax.scatter(f.longitude, f.latitude, s=sizes, color="#087f8c" if name != "Sampling candidates" else "#B37A21",
+                   edgecolors="white", linewidth=.4, alpha=.75, label=label, zorder=4)
+    ax.set(title="Water study boundary and sampling locations", xlabel="Longitude (WGS84)", ylabel="Latitude (WGS84)")
+    ax.set_aspect(1 / max(.1, math.cos(math.radians(run["study"]["lat"]))))
+    ax.grid(alpha=.2); ax.ticklabel_format(style="plain", useOffset=False)
+    from matplotlib.ticker import MaxNLocator
+    ax.xaxis.set_major_locator(MaxNLocator(5)); ax.yaxis.set_major_locator(MaxNLocator(5))
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(.5, -.17))
+    ax.annotate("N", xy=(.95, .94), xytext=(.95, .82), xycoords="axes fraction", ha="center", arrowprops=dict(arrowstyle="->"))
+    fig.text(.08, -.17, "Coordinate map; no basemap imagery. Points represent samples or unverified sampling candidates, not continuous concentrations.", fontsize=7)
+    return figure_png(fig)
+
+
+def report_scope_notes(run):
+    study = run["study"]
+    notes = [f"{study.get('waterbody_type', 'Water')} study: {study['area_km2']:.3f} km² around {study['lat']:.5f}, {study['lon']:.5f}. This local boundary is not automatically the entire waterbody or catchment.",
+             "Satellite indices, field measurements and model forecasts have different spatial/temporal support and are reported separately."]
+    from evidence import quality_findings
+    notes += [row["message"] for row in quality_findings(run) if row["code"] != "local_area"]
+    return notes
