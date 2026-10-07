@@ -68,7 +68,9 @@ from environment import (
     utc_now
 )
 
-APP_RELEASE = "1.0.0"
+APP_RELEASE = "1.1.0"
+PAGES = list(PAGES)
+if "Water data" not in PAGES:PAGES.insert(PAGES.index("Water research"), "Water data")
 
 def inject_theme():
     st.html("""<style>
@@ -266,10 +268,13 @@ def report_lock():
 
 # RESEARCH_ENGINE_START
 # This exact block is included in the offline reproduction package.
-RESEARCH_ENGINE_VERSION = "2026.10.05.water.1"
+RESEARCH_ENGINE_VERSION = "2026.10.07.water.2"
 RESEARCH_NUMERIC = ["chlorophyll_ug_l", "turbidity_ntu", "secchi_m", "temperature_c",
     "total_phosphorus_ug_l", "total_nitrogen_mg_l", "dissolved_oxygen_mg_l", "ph",
-    "phycocyanin_ug_l", "cyanobacteria_cells_ml", "salinity_psu", "conductivity_us_cm"]
+    "phycocyanin_ug_l", "cyanobacteria_cells_ml", "salinity_psu", "conductivity_us_cm",
+    "nitrate_mg_n_l", "nitrite_mg_n_l", "ammonium_mg_n_l", "orthophosphate_ug_p_l",
+    "dissolved_organic_carbon_mg_l", "silica_mg_si_l", "bod5_mg_l", "cod_mg_l",
+    "alkalinity_mg_caco3_l", "total_suspended_solids_mg_l", "oxygen_saturation_pct", "discharge_m3_s"]
 RESEARCH_METHODS = {
     "trophic": "Separate natural-log Carlson indices from measured lake/reservoir chlorophyll, Secchi depth and phosphorus; explicit applicability confirmation required.",
     "water_summary": "Observed per-site descriptive statistics and per-site monthly means. No gap filling, spatial extrapolation or inferential test.",
@@ -565,6 +570,9 @@ def research_water_summary(frame, settings):
 
 def research_compute(action, frame, settings):
     s=settings;rng=np.random.default_rng(int(s.get("seed",42)))
+    if action=="water_archive": return water_archive_analysis(frame,s)
+    if action=="water_species": return water_species_analysis(frame,s)
+    if action=="nutrient_balance": return water_nutrient_balance(frame,s)
     if action=="clean": return research_clean(frame,s)
     if action=="trophic": return research_trophic(frame,s)
     if action=="water_summary": return research_water_summary(frame,s)
@@ -703,6 +711,114 @@ def research_compute(action, frame, settings):
         notes=["Monthly means may have unequal sampling effort; inspect the observations column. No forecast is produced. Two cycles are only a minimum; longer coverage is preferable."]
     else: raise ValueError("Unknown research analysis.")
     return {"tables":tables,"notes":notes,"plots":plots}
+# Pure, offline-replayable calculations for retrieved/imported observations.
+WATER_ARCHIVE_METHOD = "Exact boundary/date filtering; explicit units and chemical fractions; non-detects and flagged values excluded from numeric summaries, never replaced with zero. Descriptive statistics per source/parameter/unit/fraction/depth/method. No spatial extrapolation."
+RESEARCH_METHODS['water_archive'] = WATER_ARCHIVE_METHOD
+RESEARCH_METHODS['water_species'] = "Coordinate/date checks on occurrence records; deduplication by GBIF ID; counts of records and named taxa. Occurrences are not abundance, absence, ecological richness estimates or bloom diagnoses."
+RESEARCH_METHODS['nutrient_balance'] = "Explicitly confirmed same-event, same-depth elemental TN and TP measurements; complete positive observations; mass ratio TN/TP and molar ratio (TN/14.0067)/(TP/30.973762). No nutrient-limitation diagnosis."
+
+
+def water_archive_analysis(frame, s):
+    if len(frame)>50000:raise ValueError('Limit the selection to 50,000 observations.')
+    f=frame.copy().reset_index(drop=True)
+    required=['site','date','latitude','longitude','parameter','unit','reported_value']
+    if any(c not in f for c in required):raise ValueError('Required columns: '+', '.join(required))
+    for c,default in {'source':'User import','fraction':'Unspecified','method':'Unspecified','depth_m':np.nan,
+                      'qualifier':'','quality_flag':'','sample_id':'','reference':'','license':'','record_id':''}.items():
+        if c not in f:f[c]=default
+    for c in ['source','site','parameter','unit','fraction','method','sample_id','qualifier','quality_flag']:
+        f[c]=f[c].fillna('').astype(str).str.strip()
+    for c in ['latitude','longitude','depth_m']:f[c]=pd.to_numeric(f[c],errors='coerce').replace([np.inf,-np.inf],np.nan)
+    f['date_original']=f.date.astype(str)
+    f['date']=pd.to_datetime(f.date,errors='coerce',utc=True,format='mixed')
+    text=f.reported_value.fillna('').astype(str).str.strip()
+    f['value']=pd.to_numeric(text,errors='coerce').replace([np.inf,-np.inf],np.nan)
+    f['censored']=text.str.contains(r'[<>≤≥]|\b(?:ND|BDL|LOD|LOQ)\b',case=False,regex=True) | f.qualifier.str.contains(r'[<>≤≥]',regex=True)
+    f['qualified']=f.qualifier.ne('')
+    polygon=shape(s['geometry'])
+    coords=f.latitude.between(-90,90)&f.longitude.between(-180,180)
+    inside=pd.Series(False,index=f.index)
+    for i in f.index[coords]:inside.at[i]=polygon.covers(Point(f.at[i,'longitude'],f.at[i,'latitude']))
+    f['inside_study']=inside
+    f['in_period']=f.date.dt.strftime('%Y-%m-%d').between(s['start'],s['end']).fillna(False)
+    # Negative temperatures/ORP may be physically meaningful. Other negative values are audited.
+    negative_ok=f.parameter.str.contains(r'temp|redox|oxidation.reduction|orp',case=False,regex=True)
+    bad_range=(f.value<0)&~negative_ok
+    ph=f.parameter.str.fullmatch(r'pH(?:\s.*)?',case=False)
+    bad_range|=ph & ~f.value.between(0,14)
+    checks={'outside boundary or invalid coordinates':~inside,'outside period or invalid date':~f.in_period,
+            'date lacks an explicit calendar day':~f.date_original.str.match(r'^\d{4}-\d{2}-\d{2}(?:$|[ T])'),
+            'missing site/parameter/unit':f.site.eq('')|f.parameter.eq('')|f.unit.eq(''),
+            'non-numeric or missing value':f.value.isna(),'censored / qualifier present':f.censored|f.qualified,
+            'provider quality flag':f.quality_flag.ne(''),'invalid numeric range':bad_range,
+            'negative sampling depth':f.depth_m.lt(0)}
+    f['exclusion_reason']=['; '.join(k for k,v in checks.items() if bool(v.iloc[i])) for i in range(len(f))]
+    f['included']=f.exclusion_reason.eq('')
+    f['analysis_value']=f.value.where(f.included)
+    f['date']=f.date.dt.strftime('%Y-%m-%d')
+    f['series']=f.source+' | '+f.parameter+' ['+f.unit+'] | '+f.fraction+' | depth '+f.depth_m.astype(str)+' m | '+f.method
+    usable=f.loc[f.included].copy();usable['month']=pd.to_datetime(usable.date,utc=True).dt.strftime('%Y-%m')
+    group=['source','parameter','unit','fraction','depth_m','method']
+    coverage=f.groupby(group,dropna=False).agg(records=('included','size'),numeric_records=('included','sum'),
+                  sites=('site','nunique'),first_date=('date','min'),last_date=('date','max'),censored_records=('censored','sum'),qualified_records=('qualified','sum')).reset_index()
+    stats=usable.groupby(group+['site'],dropna=False).analysis_value.agg(['count','mean','median','std','min','max']).reset_index()
+    monthly=usable.groupby(group+['site','month'],dropna=False).analysis_value.agg(['count','mean','median']).reset_index()
+    tables={'Observation audit':f,'Usable observations':usable,'Parameter coverage':coverage,
+            'Site statistics':stats,'Monthly statistics':monthly}
+    plots=[]
+    for i,series in enumerate(usable.series.drop_duplicates().head(8)):
+        name=f'Observed series {i+1}'
+        tables[name]=usable.loc[usable.series.eq(series),['date','analysis_value','site','latitude','longitude']].copy()
+        plots.append({'kind':'scatter','table':name,'x':'date','y':'analysis_value','group':'site','title':str(series)[:150]})
+        if i<2:plots.append({'kind':'map','table':name,'x':'longitude','y':'latitude','value':'analysis_value','geometry':s['geometry'],'title':'Site medians: '+str(series)[:120]})
+    return {'tables':tables,'plots':plots,'notes':[WATER_ARCHIVE_METHOD,
+        'Archive observations are secondary measurements. Laboratories, methods, representativeness and detection limits still require review.',
+        'Non-detects and any provider qualifiers remain in the audit. Excluding them can bias summaries; no censored-data estimator is fitted.',
+        'Observed means are sample-weighted, not area-weighted waterbody estimates. Graphs display at most eight series; all tables are exported.',
+        'Depths and methods remain separate; an unspecified method or depth means unreported, not equivalent sampling. No implicit concentration conversion.',
+        'Archive dates are used as reported calendar days. GEMStat default times (00:00/12:00) are not treated as known sampling times.']}
+
+
+def water_species_analysis(frame,s):
+    f=frame.copy().reset_index(drop=True)
+    columns=['gbif_id','scientific_name','taxon_key','rank','species','date','latitude','longitude','dataset_key','license','basis_of_record','coordinate_uncertainty_m','issues']
+    for c in columns:
+        if c not in f:f[c]=''
+    f['latitude']=pd.to_numeric(f.latitude,errors='coerce');f['longitude']=pd.to_numeric(f.longitude,errors='coerce')
+    dt=pd.to_datetime(f.date,utc=True,errors='coerce',format='mixed')
+    polygon=shape(s['geometry'])
+    f['inside_study']=[bool(pd.notna(x) and pd.notna(y) and -180<=x<=180 and -90<=y<=90 and polygon.covers(Point(x,y))) for x,y in zip(f.longitude,f.latitude)]
+    f['in_period']=dt.dt.strftime('%Y-%m-%d').between(s['start'],s['end']).fillna(False)
+    f['duplicate_id']=f.gbif_id.astype(str).duplicated()
+    f['date_precision_sufficient']=f.date.astype(str).str.match(r'^\d{4}-\d{2}-\d{2}(?:$|[ T])')
+    f['included']=f.inside_study & f.in_period & f.date_precision_sufficient & ~f.duplicate_id & f.gbif_id.astype(str).ne('')
+    good=f.loc[f.included].copy()
+    taxa=good.groupby(['scientific_name','taxon_key','rank'],dropna=False).size().rename('occurrence_records').reset_index().sort_values('occurrence_records',ascending=False)
+    good['year']=pd.to_datetime(good.date,utc=True,errors='coerce',format='mixed').dt.year
+    years=good.groupby('year').size().rename('occurrence_records').reset_index()
+    datasets=good.groupby(['dataset_key','license'],dropna=False).size().rename('occurrence_records').reset_index()
+    return {'tables':{'Occurrence audit':f,'Included occurrences':good,'Recorded taxa':taxa,'Records by year':years,'Dataset attribution':datasets},
+       'plots':[{'kind':'bar','table':'Recorded taxa','x':'scientific_name','y':'occurrence_records','title':'Occurrence records per taxon (maximum 60 shown)'},
+                {'kind':'map','table':'Included occurrences','x':'longitude','y':'latitude','geometry':s['geometry'],'title':'Retrieved species occurrence locations'}] if len(taxa) else [],
+       'notes':['GBIF occurrence counts reflect observation and digitisation effort; they are not organism counts, abundance or population trends.',
+                'No records does not establish absence. Diatom/cyanobacteria occurrences do not prove a current bloom or toxin production.',
+                'Coordinates within the boundary do not verify an aquatic habitat. Inspect uncertainty, taxonomy, dates and original datasets.',
+                'For publication, obtain a GBIF download DOI for the final selection and cite contributing datasets. Search snapshots are retained for offline analysis.']}
+
+
+def water_nutrient_balance(frame,s):
+    if not s.get('confirmed'):raise ValueError('Confirm common sample, depth, time, units and elemental basis first.')
+    f=frame.copy();tn=pd.to_numeric(f[s['tn']],errors='coerce')*float(s['tn_factor'])
+    tp=pd.to_numeric(f[s['tp']],errors='coerce')*float(s['tp_factor'])
+    valid=np.isfinite(tn)&np.isfinite(tp)&tn.gt(0)&tp.gt(0)
+    out=f[[c for c in ['sample_id','site','date','depth_m'] if c in f]].copy()
+    out['tn_mg_N_L']=tn;out['tp_mg_P_L']=tp;out['positive_complete_pair']=valid
+    out['TN_TP_mass_ratio']=(tn/tp).where(valid)
+    out['TN_TP_molar_ratio']=(tn*30.973762/(tp*14.0067)).where(valid)
+    return {'tables':{'Paired nutrient ratios':out},'plots':[],
+            'notes':['Only positive complete TN/TP pairs are used. Values must be elemental nitrogen and phosphorus per litre.',
+                     'Ratios alone do not establish nutrient limitation or eutrophication status. DIN, nitrate and orthophosphate are not total N/P.']}
+
 # RESEARCH_ENGINE_END
 
 
@@ -803,7 +919,21 @@ def research_mapping(frame,fields,key,required=()):
 def research_plot(spec,tables):
     f=tables[spec["table"]];x,y=spec["x"],spec["y"]
     fig,ax=plt.subplots(figsize=(7.4,4.5),layout="constrained")
-    if spec["kind"]=="line":
+    if spec["kind"]=="map":
+        geom=shape(spec["geometry"])
+        for poly in (geom.geoms if geom.geom_type=="MultiPolygon" else [geom]):
+            xx,yy=poly.exterior.xy;ax.plot(xx,yy,color="#405b75",linewidth=1)
+            for ring in poly.interiors:
+                xx,yy=ring.xy;ax.plot(xx,yy,color="#405b75",linewidth=.6)
+        if spec.get("value"):
+            value=spec["value"]
+            draw=f.groupby(["site",x,y],dropna=False)[value].median().reset_index()
+            sc=ax.scatter(draw[x],draw[y],c=draw[value],cmap="viridis",s=42,edgecolors="white",linewidth=.4)
+            fig.colorbar(sc,ax=ax,label="Site median; units in title")
+        else:ax.scatter(f[x],f[y],s=18,alpha=.65,color="#7755a3")
+        ax.set_aspect(1/max(.1,math.cos(math.radians(geom.centroid.y))))
+        ax.ticklabel_format(style="plain",useOffset=False)
+    elif spec["kind"]=="line":
         xx=pd.to_datetime(f[x],utc=True,errors="coerce") if x=="date" else f[x]
         ax.plot(xx,pd.to_numeric(f[y],errors="coerce"),color="#087f8c",linewidth=1.6,marker="o",markersize=3)
         fig.autofmt_xdate()
@@ -1086,6 +1216,14 @@ def research_package(run,lab,include_interpretation=True):
     for rec in lab["records"]:
         root="analyses/"+rec["id"]
         add(root+"/input.json",research_frame_json(rec["input"]))
+        point_table=rec["output"]["tables"].get("Usable observations",rec["output"]["tables"].get("Included occurrences"))
+        if point_table is not None and {"latitude","longitude"}.issubset(point_table):
+            features=[]
+            for _,point in point_table.iterrows():
+                if pd.isna(point.latitude) or pd.isna(point.longitude):continue
+                properties={c:point[c] for c in ["site","date","parameter","unit","analysis_value","depth_m","source","scientific_name","gbif_id","dataset_key","license"] if c in point}
+                features.append({"type":"Feature","geometry":{"type":"Point","coordinates":[float(point.longitude),float(point.latitude)]},"properties":properties})
+            add(root+"/observations.geojson",research_json({"type":"FeatureCollection","features":features}))
         metadata={k:rec[k] for k in ("id","action","settings","input_sha256","executed_utc","engine","method")}
         metadata["notes"]=rec["output"].get("notes",[]);metadata["plots"]=rec["output"].get("plots",[])
         metadata["model"]=rec["output"].get("model")
@@ -1367,6 +1505,7 @@ def research_stats_page(run,lab):
     for module,result in run["results"].items():
         if module=="Research validation":continue
         for title,f in result.get("tables",{}).items():
+            if title in {"Usable observations","Observation audit","Parameter coverage","Site statistics","Monthly statistics","Included occurrences","Occurrence audit","Recorded taxa","Records by year","Dataset attribution"}:continue
             if len(f)>=3:sources[module+" / "+title]=f.copy()
     upload,custom=research_upload_widget("Optional analysis table (already aligned observations)","research_custom_stats")
     if custom is not None:sources["Uploaded analysis table"]=custom
@@ -1544,6 +1683,7 @@ def overview(run):
     st.write("All calculations run in Python. The optional AI interpreter explains saved results in one request; it does not select methods, fetch data or run analyses.")
     st.dataframe(pd.DataFrame([
         {"Workspace":"Satellite water maps","What it provides":"Sentinel-2 water masks, NDCI and red-reflectance screening; real acquisition dates and clear-area coverage."},
+        {"Workspace":"Water data","What it provides":"GEMStat nutrients and water-quality measurements; GBIF occurrences; ocean archive; source-aware imports, coverage and quality audits."},
         {"Workspace":"Water research","What it provides":"Excel/CSV cleaning, sites, satellite matchups, measured water quality, correlations, regression/GAM, PCA/RDA, clustering and seasonality."},
         {"Workspace":"Phytoplankton","What it provides":"Species/genus abundance, diversity, community relationships and exploratory grouping."},
         {"Workspace":"River & marine","What it provides":"Modelled river discharge or sea-surface temperature, waves, currents and sea level; distinct from measurements."},
@@ -1645,6 +1785,13 @@ def water_outlook_page(run):
 
 
 def ai_page(run):
+    import interpretation as interpreter
+    if "ARCHIVED WATER EVIDENCE" not in interpreter.SYSTEM_PROMPT:
+        interpreter.SYSTEM_PROMPT += "\nARCHIVED WATER EVIDENCE: You may also cite any W-number or B-number evidence ID actually present in sources. Respect parameter units, sample fractions, depths, provider quality flags, partial retrievals and historical coverage. GBIF records are occurrences, not abundance, absence or bloom confirmation. Ocean climatologies and rates are not freshwater nutrient concentrations.\n"
+    if not getattr(interpreter,"_water_packet_installed",False):
+        interpreter._water_original_packet=interpreter.evidence_packet
+        interpreter.evidence_packet=water_interpretation_packet
+        interpreter._water_packet_installed=True
     from interpretation import evidence_packet, interpret_results, request_signature
     banner("AI interpretation","One optional explanation of saved water results. No agents or autonomous analysis.")
     if not need_run(run):return
@@ -1747,6 +1894,544 @@ def reports_page(run):
         st.markdown("Data attribution: [Copernicus Sentinel](https://sentinels.copernicus.eu/) · [USGS Landsat](https://www.usgs.gov/landsat-missions) · [Open-Meteo terms and access](https://open-meteo.com/en/terms) · [OpenStreetMap](https://www.openstreetmap.org/copyright). Hosted free services have usage limits; commercial deployment may require provider agreements.")
 
 
+# Water evidence connectors. No API keys, agents or extra dependencies are required.
+WATER_GEM_RECORD = '18459694'  # Corrected v3; immutable record, February 2026.
+WATER_GEM_GROUPS = {
+    'Phosphorus (total / dissolved / phosphate)':'Phosphorus.csv',
+    'Nitrogen (total / ammonia / organic)':'Other_Nitrogen.csv',
+    'Nitrate and nitrite':'Oxidized_Nitrogen.csv',
+    'Chlorophyll and other pigments':'Pigment.csv',
+    'Turbidity / transparency / optical properties':'Optical.csv',
+    'Dissolved oxygen and other gases':'Dissolved_Gas.csv',
+    'Water temperature':'Temperature.csv','pH':'pH.csv',
+    'Phytoplankton measurements':'Phytoplankton.csv',
+    'Biochemical / chemical oxygen demand':'Oxygen_Demand.csv',
+    'Carbon':'Carbon.csv','Conductivity':'Electrical_Conductance.csv',
+    'Alkalinity':'Alkalinity.csv','Silica / silicon':'Silicon.csv',
+    'Salinity':'Salinity.csv','Indicator organisms':'Indicator_Organism.csv'}
+WATER_SOURCE_LINKS = {
+    'GEMStat':'https://gemstat.org/data-gemstat/data-portal/',
+    'GBIF':'https://www.gbif.org/occurrence/search',
+    'Ocean nitrification':'https://doi.org/10.5281/zenodo.8355912',
+    'NOAA World Ocean Database':'https://www.ncei.noaa.gov/products/world-ocean-database',
+    'NOAA World Ocean Atlas':'https://www.ncei.noaa.gov/products/world-ocean-atlas',
+    'WMO WHOS':'https://wmo.int/site/wmo-hydrohub/focus-areas/increasing-capacity/wmo-hydrological-observing-system-whos',
+    'FAO AQUASTAT':'https://data.apps.fao.org/aquastat/',
+    'GRDC':'https://grdc.bafg.de/data/data_portal/'}
+
+
+def water_http(url,params=None,max_bytes=12*1024*1024,headers=None):
+    allowed={'zenodo.org','api.gbif.org'}
+    if urlparse(url).scheme!='https' or urlparse(url).hostname not in allowed:
+        raise ValueError('Unapproved water-data host.')
+    hdr={'User-Agent':'HydroScope-WaterResearch/1.1 (public research data client)','Accept-Encoding':'identity'}
+    hdr.update(headers or {})
+    started=time.monotonic()
+    with requests.get(url,params=params,headers=hdr,timeout=(30,40),stream=True) as r:
+        r.raise_for_status()
+        if urlparse(r.url).hostname not in allowed:raise ValueError('Unexpected provider redirect.')
+        data=bytearray()
+        for part in r.iter_content(65536):
+            data.extend(part)
+            if len(data)>max_bytes:raise ValueError('Response exceeds the memory limit. Narrow the dates/area or use a local subset.')
+            if time.monotonic()-started>75:raise TimeoutError('Provider response too slow; try a smaller request.')
+        return bytes(data),{'url':r.url,'status':r.status_code,'content_range':r.headers.get('Content-Range',''),
+              'retrieved_utc':utc_now(),'sha256':hashlib.sha256(data).hexdigest()}
+
+
+class WaterRemoteZip(io.RawIOBase):
+    """Read only requested ZIP byte ranges; never download the global archive silently."""
+    def __init__(self,url,size):
+        self.url=url;self.size=int(size);self.pos=0;self.cache={};self.downloaded=0;self.started=time.monotonic()
+    def seekable(self):return True
+    def readable(self):return True
+    def tell(self):return self.pos
+    def seek(self,offset,whence=0):
+        self.pos=int(offset if whence==0 else self.pos+offset if whence==1 else self.size+offset)
+        if self.pos<0:raise ValueError('Invalid ZIP seek')
+        return self.pos
+    def read(self,n=-1):
+        n=min(self.size-self.pos,self.size-self.pos if n<0 else int(n))
+        if n<=0:return b''
+        if n>24*1024*1024:raise ValueError('Select a smaller archive member.')
+        parts=[];block_size=1024*1024
+        while n:
+            block=self.pos//block_size;start=block*block_size;end=min(self.size-1,start+block_size-1)
+            if block not in self.cache:
+                if self.downloaded>80*1024*1024 or time.monotonic()-self.started>240:
+                    raise ValueError('Archive request budget reached. Select fewer parameter groups.')
+                data,meta=water_http(self.url,max_bytes=block_size+1,headers={'Range':f'bytes={start}-{end}'})
+                expected=f'bytes {start}-{end}/{self.size}'
+                if meta['status']!=206 or meta['content_range']!=expected or len(data)!=end-start+1:
+                    raise ValueError('Provider did not honor exact ZIP ranges. Use GEMStat portal download and Import measurements.')
+                self.cache[block]=data;self.downloaded+=len(data)
+                if len(self.cache)>12:self.cache.pop(next(iter(self.cache)))
+            chunk=self.cache[block];offset=self.pos-start;take=min(n,len(chunk)-offset)
+            if take<=0:raise ValueError('Incomplete archive range.')
+            parts.append(chunk[offset:offset+take]);self.pos+=take;n-=take
+        return b''.join(parts)
+
+
+def water_csv(data):
+    try:data.decode('utf-8-sig');encoding='utf-8-sig'
+    except UnicodeDecodeError:encoding='cp1252'
+    sample=data[:8000].decode(encoding,errors='replace')
+    import csv
+    try:sep=csv.Sniffer().sniff(sample,delimiters=',;\t').delimiter
+    except csv.Error:sep=';'
+    return pd.read_csv(io.BytesIO(data),sep=sep,dtype=str,keep_default_na=False,encoding=encoding)
+
+
+@st.cache_data(ttl=86400,max_entries=2,show_spinner=False)
+def water_gem_catalog():
+    raw,meta=water_http('https://zenodo.org/api/records/'+WATER_GEM_RECORD)
+    record=json.loads(raw)
+    files=[f for f in record.get('files',[]) if f['key']=='GFQA_v3.zip']
+    if len(files)!=1:raise ValueError('GEMStat archive structure changed; use portal download.')
+    item=files[0];url='https://zenodo.org/records/'+WATER_GEM_RECORD+'/files/GFQA_v3.zip'
+    remote=WaterRemoteZip(url,item['size']);tables={}
+    with zipfile.ZipFile(remote) as z:
+        members={Path(n).name:n for n in z.namelist()}
+        for name in ['GEMStat_station_metadata.csv','GEMStat_parameter_metadata.csv','GEMStat_methods_metadata.csv']:
+            if name not in members:raise ValueError('Required GEMStat metadata is missing: '+name)
+            tables[name]=water_csv(z.read(members[name]))
+        readme=z.read(members['README_output_format.txt']).decode('cp1252')
+    return {'tables':tables,'readme':readme,'file':item,'url':url,'doi':record.get('doi','10.5281/zenodo.'+WATER_GEM_RECORD),
+            'record':WATER_GEM_RECORD,'retrieved_utc':meta['retrieved_utc'],'record_metadata':record}
+
+
+def water_column(frame,*names,required=True):
+    key=lambda x:re.sub(r'[^a-z0-9]','',str(x).lower())
+    normalized={key(c):c for c in frame.columns}
+    for n in names:
+        if key(n) in normalized:return normalized[key(n)]
+    if required:raise ValueError('Unrecognized source schema; missing '+names[0]+'. Import this file with column mapping.')
+    return None
+
+
+def water_gem_stations(catalog,study):
+    stations=catalog['tables']['GEMStat_station_metadata.csv'].copy()
+    lat=water_column(stations,'Latitude','Station Latitude');lon=water_column(stations,'Longitude','Station Longitude')
+    stations['latitude']=pd.to_numeric(stations[lat],errors='coerce');stations['longitude']=pd.to_numeric(stations[lon],errors='coerce')
+    polygon=shape(study['geometry'])
+    stations=stations.loc[[pd.notna(x) and pd.notna(y) and polygon.covers(Point(x,y)) for x,y in zip(stations.longitude,stations.latitude)]].copy()
+    wt=water_column(stations,'Water Type',required=False)
+    if wt:stations=stations.loc[~stations[wt].astype(str).str.contains('ground|well',case=False,na=False)].copy()
+    return stations
+
+
+def water_gem_normalize(raw,stations,catalog):
+    if raw.empty:return pd.DataFrame(columns=['site','date','latitude','longitude','parameter','unit','reported_value'])
+    station_id=water_column(stations,'GEMS Station Number');raw_id=water_column(raw,'GEMS Station Number')
+    index=stations.drop_duplicates(station_id).set_index(station_id)
+    f=pd.DataFrame(index=raw.index)
+    f['site']=raw[raw_id].astype(str);f['latitude']=f.site.map(index.latitude);f['longitude']=f.site.map(index.longitude)
+    f['date']=raw[water_column(raw,'Sample Date')].astype(str)
+    f['depth_m']=raw[water_column(raw,'Depth')]
+    f['reported_value']=raw[water_column(raw,'Value')];f['unit']=raw[water_column(raw,'Unit')]
+    f['parameter_code']=raw[water_column(raw,'Parameter Code')]
+    parameters=catalog['tables']['GEMStat_parameter_metadata.csv']
+    pc=water_column(parameters,'Parameter Code');pn=water_column(parameters,'Parameter Long Name','Parameter Name')
+    lookup=parameters.drop_duplicates(pc).set_index(pc)[pn]
+    f['parameter']=f.parameter_code.map(lookup).fillna(f.parameter_code)
+    f['qualifier']=raw[water_column(raw,'Value Flags')]
+    quality=raw[water_column(raw,'Data Quality')].fillna('').astype(str)
+    f['provider_quality']=quality
+    f['quality_flag']=quality.where(~quality.str.strip().str.lower().isin(['good','fair','unknown']),'')
+    f.loc[quality.str.strip().eq(''),'quality_flag']='quality not supplied'
+    f['method']=raw[water_column(raw,'Analysis Method Code')]
+    f['fraction']='As specified in parameter name/code'
+    f['source']='GEMStat GFQA v3';f['reference']='https://doi.org/'+catalog['doi']
+    f['license']=raw[water_column(raw,'License Information')] if water_column(raw,'License Information',required=False) else 'CC BY 4.0 or equivalent; inspect station metadata'
+    f['record_id']=['GFQA-v3-'+str(i) for i in raw.index]
+    f['sample_id']=''  # Dates alone do not establish identical samples across parameters.
+    for c in ['Sample Time','Integrated Value','Remark']:
+        source=water_column(raw,c,required=False)
+        if source:f[c]=raw[source]
+    for c in ['Country Name','Station Identifier','Water Body Name','Water Type','Responsible Collection Agency']:
+        source=water_column(stations,c,required=False)
+        if source:f[c]=f.site.map(index[source])
+    return f.reset_index(drop=True)
+
+
+def water_gem_fetch(catalog,stations,study,groups,cap=20000):
+    station_ids=set(stations[water_column(stations,'GEMS Station Number')].astype(str))
+    chunks=[];audit=[];read_rows=0;kept=0
+    if not station_ids:return pd.DataFrame(),{'status':'No surface-water stations in the selected polygon','files':[]}
+    remote=WaterRemoteZip(catalog['url'],catalog['file']['size'])
+    with zipfile.ZipFile(remote) as z:
+        members={Path(n).name:n for n in z.namelist()}
+        for group in groups:
+            if group not in members:raise ValueError('Archive member not found: '+group)
+            member=z.getinfo(members[group])
+            if member.file_size>150*1024*1024 or member.compress_size>24*1024*1024:
+                raise ValueError('This parameter group exceeds the per-file limit; request a portal subset.')
+            # Detect the delimiter without downloading or expanding unrelated members.
+            with z.open(member) as file:
+                header=file.readline().decode('cp1252')
+            sep=';' if header.count(';')>header.count(',') else ','
+            scanned=0;complete=True
+            with z.open(member) as file:
+                for chunk in pd.read_csv(file,sep=sep,dtype=str,keep_default_na=False,encoding='cp1252',chunksize=50000):
+                    sid=water_column(chunk,'GEMS Station Number');dt=water_column(chunk,'Sample Date')
+                    selected=chunk.loc[chunk[sid].isin(station_ids)&chunk[dt].between(study['start'],study['end'])].copy()
+                    scanned+=len(chunk);read_rows+=len(chunk)
+                    available=cap-kept
+                    if len(selected)>available:selected=selected.iloc[:available];complete=False
+                    if len(selected):chunks.append(selected);kept+=len(selected)
+                    if kept>=cap:complete=False;break
+            audit.append({'file':group,'rows_scanned':scanned,'scan_complete':complete,'archive_CRC32':f'{member.CRC:08x}'})
+            if kept>=cap:break
+    if not chunks:return pd.DataFrame(),{'status':'No measurements for these dates, stations and groups','files':audit,'download_bytes':remote.downloaded}
+    raw=pd.concat(chunks,ignore_index=True)
+    return water_gem_normalize(raw,stations,catalog),{'status':'Retrieved','files':audit,'selected_groups':groups,
+        'complete':len(audit)==len(groups) and all(x['scan_complete'] for x in audit),'record_limit':cap,
+        'archive_record':catalog['record'],'archive_checksum':catalog['file']['checksum'],
+        'download_bytes':remote.downloaded,'metadata_retrieved_utc':catalog['retrieved_utc'],'retrieved_utc':utc_now()}
+
+
+@st.cache_data(ttl=3600,max_entries=20,show_spinner=False)
+def water_gbif_taxon(name):
+    raw,meta=water_http('https://api.gbif.org/v1/species/match',{'name':name,'strict':'true'})
+    match=json.loads(raw)
+    if match.get('matchType')!='EXACT' or not match.get('usageKey'):
+        raise ValueError('No exact GBIF taxon match. Enter a scientific taxon name.')
+    return match
+
+
+def water_gbif_fetch(study,match,cap=1200):
+    polygon=shape(study['geometry']);west,south,east,north=polygon.bounds
+    params={'taxonKey':int(match.get('acceptedUsageKey') or match['usageKey']),'hasCoordinate':'true','hasGeospatialIssue':'false',
+            'occurrenceStatus':'PRESENT','decimalLatitude':f'{south},{north}','decimalLongitude':f'{west},{east}',
+            'eventDate':study['start']+','+study['end'],'limit':300,'offset':0}
+    rows=[];requests_log=[];total=0;ended=False
+    for offset in range(0,cap,300):
+        params['offset']=offset;params['limit']=min(300,cap-offset)
+        raw,meta=water_http('https://api.gbif.org/v1/occurrence/search',params)
+        response=json.loads(raw);total=int(response.get('count',0));requests_log.append(meta)
+        for r in response.get('results',[]):
+            rows.append({'gbif_id':str(r.get('key','')),'scientific_name':r.get('scientificName',''),
+                'taxon_key':r.get('taxonKey'),'rank':r.get('taxonRank',''),'species':r.get('species',''),
+                'date':r.get('eventDate',''),'latitude':r.get('decimalLatitude'),'longitude':r.get('decimalLongitude'),
+                'dataset_key':r.get('datasetKey',''),'license':r.get('license',''),'basis_of_record':r.get('basisOfRecord',''),
+                'coordinate_uncertainty_m':r.get('coordinateUncertaintyInMeters'),'issues':'; '.join(r.get('issues',[])),
+                'record_url':'https://www.gbif.org/occurrence/'+str(r.get('key','')),
+                'dataset_url':'https://www.gbif.org/dataset/'+r.get('datasetKey',''),
+                'occurrence_id':r.get('occurrenceID',''),'recorded_by':r.get('recordedBy','')})
+        if response.get('endOfRecords') or not response.get('results'):ended=True;break
+    return pd.DataFrame(rows),{'taxon_match':match,'reported_bbox_matches':total,'fetched_records':len(rows),
+        'complete_bbox':ended or len(rows)>=total,'record_limit':cap,'requests':requests_log,
+        'note':'API uses bounding box; exact study polygon is applied locally. Capped searches are partial, not a random sample.'}
+
+
+@st.cache_data(ttl=86400,max_entries=1,show_spinner=False)
+def water_nitrification_book():
+    raw,meta=water_http('https://zenodo.org/api/records/8355912')
+    record=json.loads(raw)
+    item=next(f for f in record['files'] if f['key'].endswith('.xlsx') and not f['key'].startswith('Template'))
+    data,filemeta=water_http(item['links']['self'],max_bytes=3*1024*1024)
+    if item.get('checksum','').startswith('md5:') and hashlib.md5(data).hexdigest()!=item['checksum'].split(':')[1]:
+        raise ValueError('Ocean workbook checksum mismatch.')
+    book=pd.read_excel(io.BytesIO(data),sheet_name=None)
+    return book,{'doi':'10.5281/zenodo.8355912','record':record['id'],'file':item,'download':filemeta},data
+
+
+def water_nitrification_normalize(frame,sheet,parameters):
+    f=frame.copy();f.columns=[str(c).strip() for c in f]
+    lat=water_column(f,'Latitude');lon=water_column(f,'Longitude');dt=water_column(f,'Date');depth=water_column(f,'Depth (m)')
+    rows=[]
+    for i,r in f.iterrows():
+        original=str(r[dt]).strip()
+        # Never turn month-only/year-only publication dates into precise sampling days.
+        precise=isinstance(r[dt],(datetime,pd.Timestamp)) or bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:[ T].*)?',original))
+        for parameter in parameters:
+            if parameter not in f or pd.isna(r[parameter]):continue
+            unit=re.search(r'\(([^()]*)\)\s*$',parameter)
+            rows.append({'site':f"{r[lat]},{r[lon]}",'sample_id':f'{sheet}:{i+2}',
+                'date':r[dt] if precise else None,'date_reported':original,'latitude':r[lat],'longitude':r[lon],
+                'depth_m':r[depth],'parameter':parameter,'unit':unit.group(1) if unit else 'pH units' if parameter=='pH' else 'Not specified',
+                'reported_value':r[parameter],'source':'Global ocean nitrification database v2','method':'See workbook method sheets',
+                'reference':str(r.get('Data source','')),'quality_flag':'' if precise else 'date precision insufficient',
+                'license':'See Zenodo record and original study','fraction':'Marine water column'})
+    return pd.DataFrame(rows)
+
+
+def water_interpretation_packet(run):
+    """Keep mixed-unit raw values, rejected measurements and occurrence identifiers out of AI summaries."""
+    import interpretation as interpreter
+    filtered={**run,"results":{}}
+    skip=("Observation audit","Occurrence audit","Usable observations","Included occurrences","Dataset attribution")
+    for name,module in run.get("results",{}).items():
+        tables={}
+        for title,frame in module.get("tables",{}).items():
+            if any(title.endswith(t) for t in skip) or "Observed series " in title:continue
+            # Row references and personal recorder names are unnecessary for interpretation.
+            drop=[c for c in ["recorded_by","record_url","occurrence_id","gbif_id","dataset_key","reference","license"] if c in frame]
+            tables[title]=frame.drop(columns=drop)
+        filtered["results"][name]={**module,"tables":tables}
+    packet=interpreter._water_original_packet(filtered)
+    packet["water_data_note"]="Only per-parameter/unit/depth/method statistics are meaningful. Do not average across table rows with different units, sites, fractions or sampling periods. Occurrence counts are not abundance."
+    # The older interpreter computed means across statistics rows; remove those secondary aggregates.
+    for module in packet.get("modules",{}).values():
+        for title,table in module.get("tables",{}).items():
+            if any(k in title for k in ["Parameter coverage","Site statistics","Monthly statistics","Recorded taxa","Records by year"]):
+                table.pop("numeric_summary",None)
+    return packet
+
+
+def water_save_evidence(run,frame,source,provenance,action='water_archive',originals=None):
+    from environment import result,source_record
+    lab=research_state(run)
+    settings={k:run['study'][k] for k in ['geometry','start','end']}
+    settings['provenance']=provenance
+    rec=research_record(run,lab,action,frame,settings)
+    eid=('B' if action=='water_species' else 'W')+str(len(lab['records']))
+    name=source+' · '+rec['id'];module=result(name)
+    module['tables']=rec['output']['tables'];module['notes']=rec['output']['notes'][:]
+    if provenance.get('complete') is False or provenance.get('complete_bbox') is False:
+        module['notes'].insert(0,'PARTIAL RETRIEVAL: record cap reached. Counts describe this retrieved subset only; it is not a random sample.')
+    table=module['tables'].get('Usable observations',module['tables'].get('Included occurrences',pd.DataFrame()))
+    module['metrics']={'Retrieved rows':len(frame),'Rows usable after checks':len(table)}
+    if 'parameter' in table:module['metrics']['Measured parameters']=table.parameter.nunique()
+    module['facts']=[f'[{eid}] {source}: {len(frame)} retrieved/imported rows; {len(table)} pass the recorded inclusion checks. These are observations, not interpolated estimates of the whole waterbody.',*module['notes'][:2]]
+    module['sources']=[source_record(eid,source,'Species occurrences' if action=='water_species' else 'Archived or imported water measurements',
+        provenance.get('retrieved_utc',utc_now()),f"{run['study']['start']} to {run['study']['end']}",
+        'Individual records at reported sites and depths',RESEARCH_METHODS[action],url=provenance.get('source_url',''))]
+    run['results'][name]=module
+    lab.setdefault('water_records',[]).append({'record':rec['id'],'module':name,'source':source,'provenance':provenance})
+    lab['uploads'][rec['id']+'_source_provenance.json']=research_json(provenance).encode()
+    for filename,data in (originals or {}).items():lab['uploads'][rec['id']+'_'+Path(filename).name]=data
+    st.session_state.pop('interpretation',None);st.session_state.pop('exports',None);lab.pop('download',None)
+    return rec
+
+
+def water_display_record(rec,run):
+    tables=rec['output']['tables']
+    if rec['action']=='water_species':
+        good=tables['Included occurrences'];taxa=tables['Recorded taxa']
+        a,b=st.columns(2);a.metric('Included occurrence records',len(good));b.metric('Recorded named taxa',len(taxa))
+        st.caption('This is a catalogue of reported occurrences, not an abundance survey.')
+        mapped=good.copy();value=None
+    else:
+        good=tables['Usable observations'];a,b,c=st.columns(3)
+        a.metric('Measurements passing checks',len(good));b.metric('Parameters',good.parameter.nunique());c.metric('Sites',good.site.nunique())
+        if good.empty:
+            st.info('No numeric observations pass the boundary, date, unit and quality checks. See Observation audit for the reasons. No values have been invented.')
+            mapped=pd.DataFrame();value=None
+        else:
+            series=st.selectbox('Measured series to map and plot',sorted(good.series.unique()),key='water_series_'+rec['id'])
+            mapped=good.loc[good.series.eq(series)].copy();mapped['date']=pd.to_datetime(mapped.date,utc=True);value='analysis_value'
+            # Keep sites, depths, methods and units distinct. No map interpolation.
+            hover=[c for c in ['site','unit','depth_m','method','source','date','provider_quality'] if c in mapped]
+            st.plotly_chart(px.scatter(mapped,x='date',y=value,color='site',hover_data=hover,
+                title='Observed measurements at sampling dates',labels={value:series.split(' | ')[1]}),width='stretch',key='water_plot_'+rec['id'])
+            st.caption('Bubble sizes are scaled to the magnitude of each site median for the selected series. No values are assigned between sites.')
+            mapped=mapped.groupby(['site','latitude','longitude'],dropna=False).analysis_value.median().reset_index()
+    if len(mapped):
+        m=base_map(run['study']);draw=mapped.head(1500)
+        for _,r in draw.iterrows():
+            if pd.isna(r.latitude) or pd.isna(r.longitude):continue
+            if value:
+                v=float(r[value]);maximum=max(1e-12,float(draw[value].abs().max()))
+                radius=max(4,min(20,4+16*math.sqrt(abs(v)/maximum)))
+                label=f"{r.site}: {v:g} (site median)";color='#0e9f92'
+            else:radius=5;label=str(r.get('scientific_name',''))+' · '+str(r.get('date',''));color='#8055bd'
+            folium.CircleMarker([r.latitude,r.longitude],radius=radius,weight=1,color=color,fill=True,fill_opacity=.65,tooltip=html.escape(label)).add_to(m)
+        show_map(m,'water_points_'+rec['id'],height=410)
+        if len(mapped)>1500:st.caption('Map displays the first 1,500 points. Downloads contain all retained records.')
+    for note in rec['output']['notes']:st.caption(note)
+    for title,frame in tables.items():
+        if title.startswith('Observed series'):continue
+        with st.expander(f'{title} · {len(frame):,} rows',expanded=title in ['Parameter coverage','Recorded taxa']):
+            st.dataframe(frame.head(1500),hide_index=True,width='stretch')
+            st.download_button('Download '+title,safe_frame(frame).to_csv(index=False).encode('utf-8-sig'),
+                rec['id']+'_'+re.sub(r'\W+','_',title)+'.csv','text/csv',key='water_dl_'+rec['id']+title)
+    with st.expander('Source → processing → calculation → interpretation'):
+        st.write(rec['method']);st.json(rec['settings']);st.code('Input SHA-256: '+rec['input_sha256'])
+        st.caption('This exact calculation and input snapshot are included in Reports & sources → Complete ZIP → research_reproducibility.zip.')
+
+
+def water_import_ui(run,lab):
+    st.subheader('Import a measured-water subset')
+    st.write('Use a CSV or XLSX downloaded from a monitoring portal or supplied by a laboratory. Long format means one row per parameter measurement. Your existing wide Excel workflow is still under Water research → Field data.')
+    source=st.selectbox('Origin of measurements',['GEMStat portal','NOAA World Ocean Database','GRDC','WMO WHOS','FAO / local monitoring','Laboratory / other measured source'])
+    st.caption('NOAA World Ocean Atlas is a climatology, not a dated measurement table; do not import its means as field observations.')
+    if source=='GRDC':st.info('Use your authorized station subset. GRDC provides discharge, not nutrient concentrations. Keep downloaded observations and raw-data exports private under the GRDC data-sharing conditions.')
+    up=st.file_uploader('Measurement CSV / XLSX',type=['csv','xlsx'],key='water_measurement_upload')
+    if not up:return
+    if up.size>20*1024*1024:st.error('Upload a subset smaller than 20 MB.');return
+    blob=up.getvalue()
+    try:
+        if up.name.lower().endswith('.xlsx'):
+            book=pd.ExcelFile(io.BytesIO(blob));sheet=st.selectbox('Measurement worksheet',book.sheet_names,key='water_import_sheet')
+            raw=pd.read_excel(book,sheet_name=sheet,dtype=str).fillna('')
+        else:raw=water_csv(blob)
+        if len(raw)>50000:st.error('Use a subset of at most 50,000 rows.');return
+        st.dataframe(raw.head(8),hide_index=True,width='stretch')
+        st.caption('Map coordinates in WGS84 decimal degrees, date as YYYY-MM-DD, and value without changing its reported unit. Censored values such as <0.01 stay excluded from ordinary means.')
+        fields=['site','date','latitude','longitude','parameter','unit','reported_value','depth_m','qualifier','quality_flag','method','fraction','sample_id','reference','license']
+        aliases={'site':['site','GEMS Station Number','station','station_id'],'date':['date','Sample Date','sample_date'],
+          'reported_value':['reported_value','value','Value','ResultMeasureValue'],'parameter':['parameter','Parameter Long Name','Parameter Code'],
+          'qualifier':['qualifier','Value Flags'],'method':['method','Analysis Method Code']}
+        mapped={}
+        with st.expander('Match your column names',expanded=True):
+            cols=st.columns(2)
+            for i,field in enumerate(fields):
+                names=['— Select —']+list(raw.columns)
+                preferred=water_column(raw,*aliases.get(field,[field]),required=False)
+                with cols[i%2]:mapped[field]=st.selectbox(field,names,index=names.index(preferred) if preferred else 0,key='water_map_'+field)
+        st.caption('For GEMStat exports with station/parameter metadata in separate worksheets, first join those metadata by station and parameter code, then upload the resulting coordinate-and-unit table. Parameter code alone must be interpreted from the source metadata.')
+        citation=st.text_input('Source URL, DOI or laboratory report reference',key='water_import_citation')
+        confirmed=st.checkbox('This file contains measured observations; I checked dates, coordinates, parameter definitions, units and quality flags.',key='water_import_confirm')
+        if st.button('Check and add measurements',type='primary'):
+            required=['site','date','latitude','longitude','parameter','unit','reported_value']
+            if not confirmed or any(mapped[x]=='— Select —' for x in required):
+                st.error('Confirm the measurement definitions and map all seven required columns.');return
+            frame=pd.DataFrame({k:raw[v] for k,v in mapped.items() if v!='— Select —'})
+            frame['source']=source
+            if 'reference' not in frame:frame['reference']=citation
+            rec=water_save_evidence(run,frame,source,{'source_url':citation,'retrieved_utc':utc_now(),'origin':'User upload',
+               'filename':up.name,'file_sha256':hashlib.sha256(blob).hexdigest(),'mapping':mapped,'complete':'Completeness of original portal export not verified'},originals={up.name:blob})
+            lab['water_latest']=rec['id'];st.success('Measurements added with a row-by-row quality audit.')
+    except Exception as exc:st.error('Import stopped: '+str(exc)[:400])
+
+
+def water_nutrient_ui(run,lab):
+    st.subheader('Paired nutrient balance')
+    st.write('Calculate TN:TP mass and molar ratios from your measured, already matched samples. Total nitrogen and total phosphorus must describe the same sampling event and depth. Nitrate and phosphate are not interchangeable with total N and P.')
+    if lab.get('field') is None:
+        st.info('First upload your measured Excel/CSV in Water research → Field data, mapping total_nitrogen_mg_l and total_phosphorus_ug_l. Archive rows are deliberately not joined by date alone.');return
+    f=lab['field'].loc[lab['field'].included].copy()
+    if not {'total_nitrogen_mg_l','total_phosphorus_ug_l'}.issubset(f):
+        st.info('Map both total_nitrogen_mg_l and total_phosphorus_ug_l in Field data.');return
+    confirm=st.checkbox('Each row is one common sample; TN is mg N/L and TP is µg P/L, both measured, uncensored and comparable.',key='nutrient_confirm')
+    if st.button('Calculate and record TN:TP'):
+        try:
+            research_record(run,lab,'nutrient_balance',f,{'tn':'total_nitrogen_mg_l','tp':'total_phosphorus_ug_l','tn_factor':1.,'tp_factor':.001,'confirmed':confirm})
+            st.success('Paired nutrient ratios recorded.')
+        except ValueError as exc:st.error(str(exc))
+    for record in reversed(lab['records']):
+        if record['action']=='nutrient_balance':research_show_record(record);break
+    st.caption('Measured Carlson trophic indicators for suitable lakes/reservoirs remain under Water research → Field data. There is no universal TN:TP or satellite threshold that proves a harmful bloom.')
+
+
+def water_sources_ui():
+    st.subheader('What each source actually supplies')
+    rows=[
+      ['GEMStat','Direct selective retrieval','Freshwater chemistry, nutrients, pigments and other monitored parameters; station/date coverage varies. GFQA v3 observations end in 2024.'],
+      ['GBIF','Direct API retrieval','Georeferenced taxon occurrences; not abundance or proof of absence.'],
+      ['Ocean nitrification','Direct workbook retrieval + explicit selection','Historical ocean nitrification rates, nitrifiers and accompanying measurements; not an inland-water substitute.'],
+      ['NOAA World Ocean Database','Portal subset → measurement import','Ocean profiles; export a tabular subset and retain depths, units and quality flags.'],
+      ['NOAA World Ocean Atlas','Reference link','Long-term ocean climatologies; no current lake/reservoir nutrient observations.'],
+      ['WMO WHOS','Provider discovery → measurement import','Hydrological services; access, formats and measured variables depend on the contributing provider.'],
+      ['FAO AQUASTAT','Reference link / appropriate measured imports','Country/basin water-resource statistics are not point nutrient concentrations.'],
+      ['GRDC','Authorized portal subset → measurement import','Measured river discharge; download terms apply; no nutrient/species data.']]
+    st.dataframe(pd.DataFrame(rows,columns=['Source','Integration in this app','Scope']),hide_index=True,width='stretch')
+    for name,url in WATER_SOURCE_LINKS.items():st.markdown(f'[{name}]({url})')
+    st.caption('There is no verified single FAO–WMO nutrient API here: the FAO and WMO portals are shown separately. Portal-only sources are not labelled connected.')
+    st.caption('No key is needed for the new public connectors. Availability depends on upstream services. All retrieved data are historical observations unless the source explicitly states otherwise. A retrieval timestamp is not a sampling date.')
+
+
+def water_data_page(run):
+    banner('Water data','Measured nutrients, water-quality records and aquatic-taxon observations—with sources and coverage you can inspect.')
+    if not need_run(run):return
+    lab=research_state(run);state=lab.setdefault('water_ui',{})
+    section=st.radio('Water data workspace',['Freshwater measurements','Species records','Import measurements','Ocean archive','Nutrient balance','Sources & coverage'],horizontal=True,key='water_section')
+    if section=='Freshwater measurements':
+        st.subheader('GEMStat freshwater archive')
+        st.write('Find monitoring stations inside your saved study boundary, then retrieve selected measurement groups. No API key is needed.')
+        st.caption('Corrected GFQA v3 (February 2026): historical records through 2024; station and parameter coverage are incomplete globally. Earlier v1 is not used because its values were corrected by the publisher.')
+        if run['study']['start']>'2024-12-31':st.warning('Your study dates start after this archive ends. In Water study, choose a historical period through 2024 to look for GEMStat measurements, or import more recent local monitoring data.')
+        if st.button('Find GEMStat stations in my water study',type='primary'):
+            try:
+                with st.spinner('Reading station and parameter metadata from the open archive…'):
+                    catalog=water_gem_catalog();stations=water_gem_stations(catalog,run['study'])
+                state['catalog']=catalog;state['stations']=stations
+            except Exception as exc:st.error('GEMStat could not be read: '+str(exc)[:400])
+        if 'catalog' in state:
+            catalog=state['catalog'];stations=state['stations']
+            st.metric('Surface-water monitoring stations inside boundary',len(stations))
+            if stations.empty:
+                st.info('No open-archive surface-water stations were found inside this boundary. This does not mean the water is clean. Check the drawn boundary or use a local/portal measurement subset.')
+            else:
+                st.dataframe(stations,hide_index=True,width='stretch')
+                sid=water_column(stations,'GEMS Station Number')
+                selected=st.multiselect('Stations to retrieve',list(stations[sid]),default=list(stations[sid])[:20],key='water_gem_station_ids')
+                groups=st.multiselect('Parameter groups (up to 4 per request)',list(WATER_GEM_GROUPS),
+                     default=list(WATER_GEM_GROUPS)[:2]+['Chlorophyll and other pigments'],max_selections=4,key='water_gem_groups')
+                st.caption('Check station names and Water Type: being inside a polygon does not prove every station belongs to your selected waterbody. Retrieve more groups in another request. The cap is 20,000 retained rows per request.')
+                if st.button('Retrieve selected water measurements',type='primary'):
+                    try:
+                        if not groups or not selected:raise ValueError('Select at least one station and parameter group.')
+                        with st.spinner('Reading selected archive groups and filtering observations…'):
+                            selected_stations=stations.loc[stations[sid].isin(selected)]
+                            frame,provenance=water_gem_fetch(catalog,selected_stations,run['study'],[WATER_GEM_GROUPS[g] for g in groups])
+                            provenance.update({'source_url':'https://doi.org/'+catalog['doi'],'selected_stations':selected})
+                            if frame.empty:st.info(provenance['status'])
+                            else:
+                                originals={n:safe_frame(f).to_csv(index=False).encode('utf-8-sig') for n,f in catalog['tables'].items() if n!='GEMStat_station_metadata.csv'}
+                                originals['selected_station_metadata.csv']=safe_frame(selected_stations).to_csv(index=False).encode('utf-8-sig')
+                                originals['GEMStat_README.txt']=catalog['readme'].encode()
+                                rec=water_save_evidence(run,frame,'GEMStat',provenance,originals=originals);lab['water_latest']=rec['id']
+                                if not provenance.get('complete',True):st.warning('Record cap reached: this is a partial, non-random subset. Narrow stations or dates before inference.')
+                                st.success('Measured observations, quality audit, site/monthly statistics and figures added.')
+                    except Exception as exc:st.error('Retrieval stopped without replacing earlier saved results: '+str(exc)[:450])
+    elif section=='Species records':
+        st.subheader('GBIF taxon occurrences')
+        choices={'Diatoms':'Bacillariophyta','Cyanobacteria':'Cyanobacteriota','Green algae':'Chlorophyta','Ray-finned fishes':'Actinopterygii','Enter a scientific name':''}
+        choice=st.selectbox('Taxon group',list(choices),key='water_taxon_choice')
+        scientific=st.text_input('Scientific taxon name',value=choices[choice],key='water_name_'+choice)
+        cap=st.select_slider('Maximum occurrence records per request',[300,600,1200,2400],value=1200,key='water_gbif_cap')
+        st.caption('Uses your study dates and boundary. Taxon names are resolved against GBIF; records are checked against the exact polygon. These records cannot be used as phytoplankton abundance counts.')
+        if st.button('Retrieve species occurrences',type='primary'):
+            try:
+                with st.spinner('Resolving taxon and retrieving occurrence pages…'):
+                    match=water_gbif_taxon(scientific.strip());frame,provenance=water_gbif_fetch(run['study'],match,cap)
+                    provenance['source_url']=WATER_SOURCE_LINKS['GBIF']
+                    if frame.empty:st.info('No GBIF occurrences returned for this taxon, place and period. This is not evidence of absence.')
+                    else:
+                        rec=water_save_evidence(run,frame,'GBIF',provenance,action='water_species');lab['water_latest']=rec['id']
+                        st.success('Species records and dataset attribution added.')
+                        if not provenance['complete_bbox']:st.warning('Record cap reached. Counts describe a partial selection, not all records or a random sample.')
+            except Exception as exc:st.error('GBIF retrieval stopped: '+str(exc)[:400])
+    elif section=='Import measurements':water_import_ui(run,lab)
+    elif section=='Nutrient balance':water_nutrient_ui(run,lab)
+    elif section=='Sources & coverage':water_sources_ui()
+    else:
+        st.subheader('Global ocean nitrification database')
+        st.write('Retrieve the published workbook with oxidation rates, nitrifier measurements and supporting chemistry. This is an ocean research archive, not current freshwater monitoring.')
+        if run['study']['waterbody_type']!='Sea / coastal waters':
+            st.info('This source is available for Sea / coastal waters studies. Use GEMStat or local measurements for rivers, lakes and reservoirs.')
+        else:
+            if st.button('Load ocean nitrification workbook'):
+                try:
+                    with st.spinner('Loading the versioned Zenodo workbook…'):state['ocean']=water_nitrification_book()
+                except Exception as exc:st.error('Ocean archive unavailable: '+str(exc)[:400])
+            if 'ocean' in state:
+                book,provenance,blob=state['ocean']
+                sheets=[k for k in book if 'metadata' not in k.lower()]
+                sheet=st.selectbox('Published data worksheet',sheets,key='water_ocean_sheet')
+                raw=book[sheet].copy();raw.columns=[str(c).strip() for c in raw]
+                st.dataframe(raw.head(8),hide_index=True,width='stretch')
+                candidates=[c for c in raw if c not in ['Data source','Date','Latitude','Longitude','Depth (m)']]
+                parameters=st.multiselect('Published measurements',candidates,default=candidates[:1],max_selections=5,key='water_ocean_parameters_'+sheet)
+                st.warning('Many publications report only a month, season or year. Those rows retain their original date text but cannot pass exact-day date filtering; no sampling day is invented. Units stay as published, including rates per day and gene copies per litre.')
+                if st.button('Add selected ocean observations'):
+                    try:
+                        frame=water_nitrification_normalize(raw,sheet,parameters)
+                        if frame.empty:raise ValueError('No selected measurements in the sheet.')
+                        provenance={**provenance,'source_url':WATER_SOURCE_LINKS['Ocean nitrification'],'sheet':sheet,'parameters':parameters}
+                        rec=water_save_evidence(run,frame,'Ocean nitrification',provenance,originals={'nitrification_source.xlsx':blob});lab['water_latest']=rec['id']
+                    except Exception as exc:st.error('Ocean processing stopped: '+str(exc)[:400])
+    records=[r for r in lab['records'] if r['action'] in ['water_archive','water_species']]
+    if records:
+        st.divider();st.subheader('Saved water-data results')
+        ids=[r['id'] for r in records];latest=lab.get('water_latest',ids[-1])
+        selected=st.selectbox('Result to inspect',ids,index=ids.index(latest) if latest in ids else len(ids)-1,format_func=lambda x:next(r['id']+' · '+r['action'].replace('_',' ') for r in records if r['id']==x))
+        rec=next(r for r in records if r['id']==selected);water_display_record(rec,run)
+        st.caption('For correlation, regression/GAM, PCA or seasonality, open Water research → Statistics. Use a single unit/parameter series or an explicitly matched wide table, not mixed long-format measurements.')
+
+
 def main():
     st.set_page_config(page_title="HydroScope | Water Research",layout="wide",initial_sidebar_state="expanded")
     inject_theme()
@@ -1767,7 +2452,7 @@ def main():
             st.caption(f"{run['study']['start']} → {run['study']['end']}")
             st.caption(f"{len(run['results'])} evidence modules · {len(run['errors'])} unavailable")
         else:st.write("Start with a waterbody and a research question.")
-        st.divider();st.caption("1.0.0 · Water only · No agents")
+        st.divider();st.caption(APP_RELEASE+" · Water only · No agents")
         st.caption("Calculations and reports work without AI.")
     a,b=st.columns([4,1])
     a.caption("HYDROSCOPE WATER RESEARCH · "+page)
@@ -1775,6 +2460,7 @@ def main():
     if page=="Overview":overview(run)
     elif page=="Water study":study_page()
     elif page=="Satellite water maps":satellite_page(run)
+    elif page=="Water data":water_data_page(run)
     elif page=="Water research":research_page(run)
     elif page=="River & marine":water_outlook_page(run)
     elif page=="AI interpretation":ai_page(run)
